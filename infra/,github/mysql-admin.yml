@@ -64,6 +64,7 @@ jobs:
             --query "properties.outboundIpAddresses"
 
       - name: Execute action
+        if: ${{ inputs.action != 'smoke' }}
         env:
           MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
           MYSQL_APP_PASSWORD:   ${{ secrets.MYSQL_APP_PASSWORD }}
@@ -75,7 +76,7 @@ jobs:
               SKU_NAME=Standard_B1ms bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              # We'll also pass the tier on scale (see below)
+              # Explicitly set tier when moving to a GP SKU
               TIER=GeneralPurpose TARGET_SKU=Standard_D2ds_v5 bash infra/mysql/scale-mysql.sh
               ;;
             scale-down)
@@ -95,4 +96,3 @@ jobs:
               exit 1
               ;;
           esac
-
