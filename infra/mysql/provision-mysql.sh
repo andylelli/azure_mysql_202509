@@ -125,7 +125,7 @@ fi
 az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
 az config set extension.dynamic_install_allow_preview=true >/dev/null
 
-# Wait for firewall propagation and test connectivity
+# Wait for firewall propagation and test connectivity (best-effort)
 echo "==> Wait for firewall propagation & test connectivity"
 for attempt in {1..18}; do
   if az mysql flexible-server connect \
@@ -138,17 +138,44 @@ for attempt in {1..18}; do
   sleep 10
 done
 
-echo "==> Create least-privileged app user (via SQL)"
-SQL="
-CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';
-FLUSH PRIVILEGES;
-"
+echo "==> Create least-privileged app user (via SQL, single statements)"
+# 1) Create user if missing
 az mysql flexible-server execute \
   --name "$SERVER" \
   --admin-user "$ADMIN_USER" \
   --admin-password "$MYSQL_ADMIN_PASSWORD" \
   --database-name "$DB_NAME" \
-  --querytext "$SQL" >/dev/null
+  --querytext "CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';" >/dev/null
 
-echo "==> Wire Container App secrets + env
+# 2) Ensure/refresh password (idempotent)
+az mysql flexible-server execute \
+  --name "$SERVER" \
+  --admin-user "$ADMIN_USER" \
+  --admin-password "$MYSQL_ADMIN_PASSWORD" \
+  --database-name "$DB_NAME" \
+  --querytext "ALTER USER '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';" >/dev/null
+
+# 3) Grant privileges on the app database
+az mysql flexible-server execute \
+  --name "$SERVER" \
+  --admin-user "$ADMIN_USER" \
+  --admin-password "$MYSQL_ADMIN_PASSWORD" \
+  --database-name "$DB_NAME" \
+  --querytext "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';" >/dev/null
+
+echo "==> Wire Container App secrets + env"
+HOST=$(az mysql flexible-server show -g "$RG" -n "$SERVER" --query fullyQualifiedDomainName -o tsv)
+
+az containerapp secret set -g "$RG" -n "$APP_NAME" --secrets \
+  db-host="$HOST" db-database="$DB_NAME" db-username="$APP_USER" db-password="$MYSQL_APP_PASSWORD" >/dev/null
+
+az containerapp update -g "$RG" -n "$APP_NAME" --set-env-vars \
+  DB_CONNECTION=mysql \
+  DB_HOST=secretref:db-host \
+  DB_DATABASE=secretref:db-database \
+  DB_USERNAME=secretref:db-username \
+  DB_PASSWORD=secretref:db-password \
+  DB_PORT=3306 DB_SOCKET= \
+  LOG_CHANNEL=stderr LOG_LEVEL=info >/dev/null
+
+echo "==> Done. Host: $HOST"
