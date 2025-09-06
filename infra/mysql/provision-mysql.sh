@@ -4,18 +4,18 @@ set -euo pipefail
 # --- Inputs (override via env or workflow) ---
 RG="${RG:-laravel-rg}"
 LOC="${LOC:-uksouth}"
-SERVER="${SERVER:-fest-db}"                     # unique, lowercase, 3-63 chars
+SERVER="${SERVER:-fest-db}"
 
 # Exact version string required by Azure; default to 8.4 (LTS).
-MYSQL_VERSION="${MYSQL_VERSION:-8.4}"          # allowed: 8.4, 8.0.21, 5.7, or explicit 8.0.x
+MYSQL_VERSION="${MYSQL_VERSION:-8.4}"          # 8.4, 8.0.21, 5.7, or explicit 8.0.x
 
-SKU_NAME="${SKU_NAME:-Standard_B1ms}"          # default Burstable so create never mismatches
-TIER="${TIER:-}"                                # Burstable | GeneralPurpose | BusinessCritical (auto-infer if empty)
-STORAGE_GB="${STORAGE_GB:-20}"                  # min 20; can only increase later
-BACKUP_DAYS="${BACKUP_DAYS:-7}"                 # 1-35
+SKU_NAME="${SKU_NAME:-Standard_B1ms}"          # default Burstable
+TIER="${TIER:-}"                                # Burstable | GeneralPurpose | BusinessCritical (auto-infer)
+STORAGE_GB="${STORAGE_GB:-20}"
+BACKUP_DAYS="${BACKUP_DAYS:-7}"
 DB_NAME="${DB_NAME:-laravel}"
 APP_USER="${APP_USER:-appuser}"
-ADMIN_USER="${ADMIN_USER:-mysqladmin}"          # Azure forms login as 'mysqladmin'
+ADMIN_USER="${ADMIN_USER:-mysqladmin}"
 ADMIN_IP="${ADMIN_IP:-}"                        # optional: your public IP (firewall)
 
 # App/Env
@@ -32,7 +32,7 @@ case "$MYSQL_VERSION" in
   8.4|8.0.21|5.7) : ;;
   8.0.*) : ;;
   *) echo "Unsupported MYSQL_VERSION='$MYSQL_VERSION'. Use 8.4, 8.0.21, 5.7, or explicit 8.0.x"; exit 2 ;;
-esac
+endac
 
 # --- Infer TIER from SKU if not provided ---
 if [[ -z "${TIER}" ]]; then
@@ -47,6 +47,7 @@ echo "==> Effective tier: $TIER, SKU: $SKU_NAME, Version: $MYSQL_VERSION"
 
 echo "==> Ensure server exists (or create)"
 if ! az mysql flexible-server show -g "$RG" -n "$SERVER" >/dev/null 2>&1; then
+  # NOTE: --public-access None = public connectivity method with no IPs allowed yet.
   az mysql flexible-server create \
     --resource-group "$RG" --name "$SERVER" --location "$LOC" \
     --admin-user "$ADMIN_USER" --admin-password "$MYSQL_ADMIN_PASSWORD" \
@@ -57,10 +58,6 @@ if ! az mysql flexible-server show -g "$RG" -n "$SERVER" >/dev/null 2>&1; then
     --public-access None \
     --yes
 fi
-
-# NEW: ensure Public Network Access is Enabled (we created with None)
-echo "==> Ensure Public Network Access is Enabled"
-az mysql flexible-server update -g "$RG" -n "$SERVER" --public-network-access Enabled >/dev/null
 
 echo "==> Enforce TLS"
 az mysql flexible-server parameter set -g "$RG" -s "$SERVER" \
@@ -77,7 +74,7 @@ for ip in "${ACA_IPS[@]}"; do
   i=$((i+1))
 done
 
-# Optional admin IP rule (your laptop, if provided)
+# Optional admin IP rule (your laptop/workstation)
 if [[ -n "${ADMIN_IP}" ]]; then
   az mysql flexible-server firewall-rule create -g "$RG" -s "$SERVER" \
     --name "admin-ip" --start-ip-address "$ADMIN_IP" --end-ip-address "$ADMIN_IP" >/dev/null || true
@@ -86,7 +83,7 @@ fi
 echo "==> Create DB (idempotent)"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
-# Prepare to temporarily open firewall for the GitHub runner's public IP (for the SQL step)
+# --- Temporarily allow the GitHub runner IP for the SQL step, then retry until open ---
 TEMP_RULE=""
 cleanup() {
   if [[ -n "$TEMP_RULE" ]]; then
@@ -95,7 +92,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Try to detect the runner IP if ADMIN_IP not provided
 if [[ -z "${ADMIN_IP}" ]]; then
   echo "==> Detect runner public IP for temporary firewall rule"
   MYIP="$(curl -fsS https://ifconfig.me 2>/dev/null || curl -fsS https://api.ipify.org 2>/dev/null || true)"
@@ -109,11 +105,24 @@ if [[ -z "${ADMIN_IP}" ]]; then
   fi
 fi
 
-echo "==> Create least-privileged app user (via SQL)"
-# Ensure CLI can install helper extension non-interactively
+# Ensure CLI helper is available
 az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
 az config set extension.dynamic_install_allow_preview=true >/dev/null
 
+# Wait for firewall propagation and test connectivity
+echo "==> Wait for firewall propagation & test connectivity"
+for attempt in {1..18}; do
+  if az mysql flexible-server connect \
+       --name "$SERVER" -u "$ADMIN_USER" -p "$MYSQL_ADMIN_PASSWORD" \
+       -d "$DB_NAME" --querytext "SELECT 1;" >/dev/null 2>&1; then
+    echo "   Connectivity OK."
+    break
+  fi
+  echo "   Attempt $attempt/18: waiting 10s..."
+  sleep 10
+done
+
+echo "==> Create least-privileged app user (via SQL)"
 SQL="
 CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';
