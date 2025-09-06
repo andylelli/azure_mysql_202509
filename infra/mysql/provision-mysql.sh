@@ -32,7 +32,7 @@ case "$MYSQL_VERSION" in
   8.4|8.0.21|5.7) : ;;
   8.0.*) : ;;
   *) echo "Unsupported MYSQL_VERSION='$MYSQL_VERSION'. Use 8.4, 8.0.21, 5.7, or explicit 8.0.x"; exit 2 ;;
-endac
+esac
 
 # --- Infer TIER from SKU if not provided ---
 if [[ -z "${TIER}" ]]; then
