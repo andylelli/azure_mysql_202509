@@ -6,15 +6,14 @@ RG="${RG:-laravel-rg}"
 LOC="${LOC:-uksouth}"
 SERVER="${SERVER:-fest-db}"                     # unique, lowercase, 3-63 chars
 MYSQL_VERSION="${MYSQL_VERSION:-8.0}"
-SKU_NAME="${SKU_NAME:-Standard_D2ds_v5}"        # GP default; pass Standard_B1ms for Burstable
-TIER="${TIER:-}"                                # Burstable | GeneralPurpose | BusinessCritical (auto-inferred if empty)
+SKU_NAME="${SKU_NAME:-Standard_B1ms}"           # DEFAULT TO BURSTABLE to avoid tier mismatch
+TIER="${TIER:-}"                                # Burstable | GeneralPurpose | BusinessCritical (auto-infer if empty)
 STORAGE_GB="${STORAGE_GB:-20}"                  # min 20; can only increase later
 BACKUP_DAYS="${BACKUP_DAYS:-7}"                 # 1-35
-MAINT_POLICY="${MAINT_POLICY:-system}"          # kept for future use
 DB_NAME="${DB_NAME:-laravel}"
 APP_USER="${APP_USER:-appuser}"
-ADMIN_USER="${ADMIN_USER:-mysqladmin}"          # Azure forms login as 'mysqladmin' (not mysqladmin@server in CLI)
-ADMIN_IP="${ADMIN_IP:-}"                        # e.g. your workstation public IP (optional)
+ADMIN_USER="${ADMIN_USER:-mysqladmin}"          # Azure forms login as 'mysqladmin'
+ADMIN_IP="${ADMIN_IP:-}"                        # your workstation public IP (optional)
 
 # App/Env
 APP_NAME="${APP_NAME:-laravel-aca}"
@@ -30,7 +29,7 @@ if [[ -z "${TIER}" ]]; then
     Standard_B*) TIER="Burstable" ;;
     Standard_D*|GP*) TIER="GeneralPurpose" ;;
     Standard_E*|BC*) TIER="BusinessCritical" ;;
-    *) TIER="Burstable" ;;  # safe default
+    *) TIER="Burstable" ;;
   esac
 fi
 echo "==> Effective tier: $TIER, SKU: $SKU_NAME"
@@ -71,7 +70,7 @@ fi
 echo "==> Create DB and least-privileged app user"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
-# (Exactly like your original execute section)
+# Execute SQL (same as your original approach)
 SQL="
 CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';
