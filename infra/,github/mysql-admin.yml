@@ -63,6 +63,34 @@ jobs:
           az rest --method get --uri "https://management.azure.com${ENV_ID}?api-version=2025-01-01" \
             --query "properties.outboundIpAddresses"
 
+      # Ensure the subscription is registered for MySQL (one-time per subscription).
+      # If the SP lacks subscription-level permission, we fail fast with a helpful message.
+      - name: Ensure Microsoft.DBforMySQL provider is registered
+        run: |
+          set -euo pipefail
+          STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "NotRegistered")
+          echo "Microsoft.DBforMySQL registrationState=${STATE}"
+          if [ "$STATE" != "Registered" ]; then
+            echo "Attempting to register Microsoft.DBforMySQL..."
+            if az provider register --namespace Microsoft.DBforMySQL >/dev/null 2>&1; then
+              for i in {1..30}; do
+                sleep 5
+                STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "NotRegistered")
+                echo "registrationState=${STATE}"
+                [ "$STATE" = "Registered" ] && break
+              done
+            else
+              echo "::error::Failed to request provider registration. This usually means the service principal does not have subscription-level permission. Ask a Subscription Owner to register 'Microsoft.DBforMySQL' or grant this SP a role at subscription scope."
+              echo "Portal quick link: https://portal.azure.com/#view/Microsoft_Azure_Resources/ProviderMenuBlade/~/Microsoft.DBforMySQL"
+              exit 1
+            fi
+            if [ "$STATE" != "Registered" ]; then
+              echo "::error::Microsoft.DBforMySQL is still not Registered. Please register in the Azure Portal, then re-run."
+              echo "Portal quick link: https://portal.azure.com/#view/Microsoft_Azure_Resources/ProviderMenuBlade/~/Microsoft.DBforMySQL"
+              exit 1
+            fi
+          fi
+
       - name: Execute action
         if: ${{ inputs.action != 'smoke' }}
         env:
@@ -72,11 +100,11 @@ jobs:
           set -euo pipefail
           case "${{ inputs.action }}" in
             provision)
-              # Version must be exact. Use 8.4 (MySQL LTS) to avoid the 8.0 vs 8.0.21 mismatch.
+              # Use exact version string (8.4 LTS) + Burstable SKU; script infers/uses TIER.
               MYSQL_VERSION=8.4 SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              # Allowed GP SKU in UK South
+              # Allowed GP SKU in UK South for MySQL Flexible Server (short restart)
               TIER=GeneralPurpose TARGET_SKU=Standard_D2ads_v5 bash infra/mysql/scale-mysql.sh
               ;;
             scale-down)
