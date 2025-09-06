@@ -6,8 +6,8 @@ RG="${RG:-laravel-rg}"
 LOC="${LOC:-uksouth}"
 SERVER="${SERVER:-fest-db}"                     # unique, lowercase, 3-63 chars
 
-# IMPORTANT: Azure expects an exact version string. Default to 8.4 (LTS).
-MYSQL_VERSION="${MYSQL_VERSION:-8.4}"          # allowed examples: 8.4, 8.0.21, 5.7
+# Exact version string required by Azure; default to 8.4 (LTS).
+MYSQL_VERSION="${MYSQL_VERSION:-8.4}"          # allowed: 8.4, 8.0.21, 5.7, or explicit 8.0.x
 
 SKU_NAME="${SKU_NAME:-Standard_B1ms}"          # default Burstable so create never mismatches
 TIER="${TIER:-}"                                # Burstable | GeneralPurpose | BusinessCritical (auto-infer if empty)
@@ -16,7 +16,7 @@ BACKUP_DAYS="${BACKUP_DAYS:-7}"                 # 1-35
 DB_NAME="${DB_NAME:-laravel}"
 APP_USER="${APP_USER:-appuser}"
 ADMIN_USER="${ADMIN_USER:-mysqladmin}"          # Azure forms login as 'mysqladmin'
-ADMIN_IP="${ADMIN_IP:-}"                        # your workstation public IP (optional)
+ADMIN_IP="${ADMIN_IP:-}"                        # optional: your public IP
 
 # App/Env
 APP_NAME="${APP_NAME:-laravel-aca}"
@@ -28,10 +28,10 @@ ENV_NAME="${ENV_NAME:-laravel-env}"
 
 # --- Normalize / validate version ---
 case "$MYSQL_VERSION" in
-  8|8.0) MYSQL_VERSION="8.0.21" ;;            # map shorthand 8.0 -> exact Azure-supported build
-  8.4|8.0.21|5.7) : ;;                        # allowed as-is
-  8.0.*) : ;;                                 # any explicit 8.0.x passes through
-  *) echo "Unsupported MYSQL_VERSION='$MYSQL_VERSION'. Use one of: 8.4, 8.0.21, 5.7 (or explicit 8.0.x)"; exit 2 ;;
+  8|8.0) MYSQL_VERSION="8.0.21" ;;
+  8.4|8.0.21|5.7) : ;;
+  8.0.*) : ;;
+  *) echo "Unsupported MYSQL_VERSION='$MYSQL_VERSION'. Use 8.4, 8.0.21, 5.7, or explicit 8.0.x"; exit 2 ;;
 esac
 
 # --- Infer TIER from SKU if not provided ---
@@ -81,17 +81,18 @@ fi
 echo "==> Create DB and least-privileged app user"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
-# Execute SQL — FIXED: use --name/-n (required by this subcommand) and include DB name for clarity
+# Install preview helper non-interactively (safe if already set)
+az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
+az config set extension.dynamic_install_allow_preview=true >/dev/null
+
+# Execute SQL (FIXED: no --resource-group here)
 SQL="
 CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';
 FLUSH PRIVILEGES;
 "
-az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
-az config set extension.dynamic_install_allow_preview=true >/dev/null
 az mysql flexible-server execute \
   --name "$SERVER" \
-  --resource-group "$RG" \
   --admin-user "$ADMIN_USER" \
   --admin-password "$MYSQL_ADMIN_PASSWORD" \
   --database-name "$DB_NAME" \
