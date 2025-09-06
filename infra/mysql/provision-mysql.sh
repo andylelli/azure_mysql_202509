@@ -69,15 +69,23 @@ readarray -t ACA_IPS < <(az rest --method get --uri "https://management.azure.co
   --query "properties.outboundIpAddresses[]" -o tsv)
 i=0
 for ip in "${ACA_IPS[@]}"; do
-  az mysql flexible-server firewall-rule create -g "$RG" -s "$SERVER" \
-    --name "aca-${i}" --start-ip-address "$ip" --end-ip-address "$ip" >/dev/null || true
+  az mysql flexible-server firewall-rule create \
+    --resource-group "$RG" \
+    --name "$SERVER" \
+    --rule-name "aca-${i}" \
+    --start-ip-address "$ip" \
+    --end-ip-address "$ip" >/dev/null || true
   i=$((i+1))
 done
 
 # Optional admin IP rule (your laptop/workstation)
 if [[ -n "${ADMIN_IP}" ]]; then
-  az mysql flexible-server firewall-rule create -g "$RG" -s "$SERVER" \
-    --name "admin-ip" --start-ip-address "$ADMIN_IP" --end-ip-address "$ADMIN_IP" >/dev/null || true
+  az mysql flexible-server firewall-rule create \
+    --resource-group "$RG" \
+    --name "$SERVER" \
+    --rule-name "admin-ip" \
+    --start-ip-address "$ADMIN_IP" \
+    --end-ip-address "$ADMIN_IP" >/dev/null || true
 fi
 
 echo "==> Create DB (idempotent)"
@@ -87,7 +95,11 @@ az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/nul
 TEMP_RULE=""
 cleanup() {
   if [[ -n "$TEMP_RULE" ]]; then
-    az mysql flexible-server firewall-rule delete -g "$RG" -s "$SERVER" -n "$TEMP_RULE" --yes >/dev/null 2>&1 || true
+    az mysql flexible-server firewall-rule delete \
+      --resource-group "$RG" \
+      --name "$SERVER" \
+      --rule-name "$TEMP_RULE" \
+      --yes >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -98,8 +110,12 @@ if [[ -z "${ADMIN_IP}" ]]; then
   if [[ -n "$MYIP" ]]; then
     TEMP_RULE="gha-$(date +%s)"
     echo "   Detected IP: $MYIP -> creating rule $TEMP_RULE"
-    az mysql flexible-server firewall-rule create -g "$RG" -s "$SERVER" \
-      --name "$TEMP_RULE" --start-ip-address "$MYIP" --end-ip-address "$MYIP" >/dev/null || true
+    az mysql flexible-server firewall-rule create \
+      --resource-group "$RG" \
+      --name "$SERVER" \
+      --rule-name "$TEMP_RULE" \
+      --start-ip-address "$MYIP" \
+      --end-ip-address "$MYIP" >/dev/null || true
   else
     echo "   Could not detect runner IP. If this step fails, re-run with 'admin_ip' input set."
   fi
@@ -135,19 +151,4 @@ az mysql flexible-server execute \
   --database-name "$DB_NAME" \
   --querytext "$SQL" >/dev/null
 
-echo "==> Wire Container App secrets + env"
-HOST=$(az mysql flexible-server show -g "$RG" -n "$SERVER" --query fullyQualifiedDomainName -o tsv)
-
-az containerapp secret set -g "$RG" -n "$APP_NAME" --secrets \
-  db-host="$HOST" db-database="$DB_NAME" db-username="$APP_USER" db-password="$MYSQL_APP_PASSWORD" >/dev/null
-
-az containerapp update -g "$RG" -n "$APP_NAME" --set-env-vars \
-  DB_CONNECTION=mysql \
-  DB_HOST=secretref:db-host \
-  DB_DATABASE=secretref:db-database \
-  DB_USERNAME=secretref:db-username \
-  DB_PASSWORD=secretref:db-password \
-  DB_PORT=3306 DB_SOCKET= \
-  LOG_CHANNEL=stderr LOG_LEVEL=info >/dev/null
-
-echo "==> Done. Host: $HOST"
+echo "==> Wire Container App secrets + env
