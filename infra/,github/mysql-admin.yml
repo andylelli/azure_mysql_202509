@@ -1,0 +1,83 @@
+name: MySQL Admin
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "provision | scale-up | scale-down | stop | start | delete"
+        required: true
+        type: choice
+        options: [provision, scale-up, scale-down, stop, start, delete]
+      admin_ip:
+        description: "Optional: your public IP to allow direct admin access"
+        required: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: mysql-admin-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:  ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare Azure CLI
+        run: |
+          set -euxo pipefail
+          az extension add -n containerapp --upgrade || true
+          # MySQL Flexible Server commands live in rdbms; some setups still use rdbms-flexible-server — try both.
+          az extension add -n rdbms --upgrade || az extension add -n rdbms-flexible-server --upgrade || true
+
+      - name: Set environment defaults
+        run: |
+          echo "RG=laravel-rg" >> $GITHUB_ENV
+          echo "LOC=uksouth" >> $GITHUB_ENV
+          echo "ENV_NAME=laravel-env" >> $GITHUB_ENV
+          echo "APP_NAME=laravel-aca" >> $GITHUB_ENV
+          echo "SERVER=fest-db" >> $GITHUB_ENV
+          if [ -n "${{ github.event.inputs.admin_ip }}" ]; then
+            echo "ADMIN_IP=${{ github.event.inputs.admin_ip }}" >> $GITHUB_ENV
+          fi
+
+      - name: Execute action
+        env:
+          MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
+          MYSQL_APP_PASSWORD:   ${{ secrets.MYSQL_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          case "${{ inputs.action }}" in
+            provision)
+              bash infra/mysql/provision-mysql.sh
+              ;;
+            scale-up)
+              TARGET_SKU=Standard_D2ds_v5 bash infra/mysql/scale-mysql.sh
+              ;;
+            scale-down)
+              TARGET_SKU=Standard_B1ms bash infra/mysql/scale-mysql.sh
+              ;;
+            stop)
+              bash infra/mysql/stop-start-mysql.sh stop
+              ;;
+            start)
+              bash infra/mysql/stop-start-mysql.sh start
+              ;;
+            delete)
+              bash infra/mysql/delete-mysql.sh
+              ;;
+            *)
+              echo "Unknown action: ${{ inputs.action }}" >&2
+              exit 1
+              ;;
+          esac
