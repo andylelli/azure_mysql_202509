@@ -149,3 +149,11 @@ az ad app federated-credential create --id "$APP_OBJECT_ID" --parameters @fc-pr.
 
 XMYSQL_XADMIN_XPASSWORD = DerTbcVqWedY
 XMYSQL_XAPP_XPASSWORD = MeFshjYgfgDF
+
+###################################################
+# 5 - MYSQL SSL Cert 
+# Run in Azure Cloud Shell (Bash).
+###################################################
+
+az containerapp exec -g laravel-rg -n laravel-aca --command "/bin/sh -lc 'ls -l /etc/ssl/certs/DigiCertGlobalRootCA.crt.pem || echo not-found'"
+az containerapp exec -g laravel-rg -n laravel-aca --command "/bin/sh -lc 'php -r \"\$h=getenv(\"DB_HOST\");\$d=getenv(\"DB_DATABASE\");\$u=getenv(\"DB_USERNAME\");\$p=getenv(\"DB_PASSWORD\");\$ca=getenv(\"DB_SSL_CA\")?:\"/etc/ssl/certs/DigiCertGlobalRootCA.crt.pem\";\$pdo=new PDO(\"mysql:host=\$h;port=3306;dbname=\$d;charset=utf8mb4\",\$u,\$p,[PDO::MYSQL_ATTR_SSL_CA=>\$ca]);var_export(\$pdo->query(\"SELECT @@ssl_version,@@ssl_cipher\")->fetch(PDO::FETCH_ASSOC));echo PHP_EOL;\"'"

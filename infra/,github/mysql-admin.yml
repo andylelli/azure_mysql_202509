@@ -20,6 +20,7 @@ jobs:
       contents: read
     concurrency:
       group: mysql-admin-${{ github.ref }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,8 +49,7 @@ jobs:
             echo "ADMIN_IP=${{ github.event.inputs.admin_ip }}" >> $GITHUB_ENV
           fi
 
-      # ---- Smoke test only (no .sh scripts) ----
-      - name: Smoke test (OIDC & RBAC)
+      - name: Smoke test (OIDC & RBAC only)
         run: |
           set -euxo pipefail
           echo "== Account =="
@@ -63,9 +63,7 @@ jobs:
           az rest --method get --uri "https://management.azure.com${ENV_ID}?api-version=2025-01-01" \
             --query "properties.outboundIpAddresses"
 
-      # Skip all provisioning/scaling steps if action == smoke
       - name: Execute action
-        if: ${{ inputs.action != 'smoke' }}
         env:
           MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
           MYSQL_APP_PASSWORD:   ${{ secrets.MYSQL_APP_PASSWORD }}
@@ -73,13 +71,15 @@ jobs:
           set -euo pipefail
           case "${{ inputs.action }}" in
             provision)
-              bash infra/mysql/provision-mysql.sh
+              # Create in Burstable (matches default tier) to avoid mismatch
+              SKU_NAME=Standard_B1ms bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              TARGET_SKU=Standard_D2ds_v5 bash infra/mysql/scale-mysql.sh
+              # We'll also pass the tier on scale (see below)
+              TIER=GeneralPurpose TARGET_SKU=Standard_D2ds_v5 bash infra/mysql/scale-mysql.sh
               ;;
             scale-down)
-              TARGET_SKU=Standard_B1ms bash infra/mysql/scale-mysql.sh
+              TIER=Burstable TARGET_SKU=Standard_B1ms bash infra/mysql/scale-mysql.sh
               ;;
             stop)
               bash infra/mysql/stop-start-mysql.sh stop
@@ -95,3 +95,4 @@ jobs:
               exit 1
               ;;
           esac
+
