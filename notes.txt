@@ -1,0 +1,151 @@
+###################################################
+# 1 - Create the App Registration + Service Principal
+# Run in Azure Cloud Shell (Bash).
+###################################################
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === inputs (edit these two only) ===
+SUBSCRIPTION_ID="fff37d4f-d044-4d79-b5aa-b119708ab6ee"
+APP_NAME="github-oidc-andylelli-mysql_202509"
+# ====================================
+
+echo "==> Using subscription"
+az account set --subscription "$SUBSCRIPTION_ID"
+echo "Subscription: $(az account show --query name -o tsv)"
+
+echo "==> Create (or get) App Registration"
+APP_ID=$(az ad app list --display-name "$APP_NAME" --query "[0].appId" -o tsv || true)
+if [[ -z "${APP_ID}" ]]; then
+  APP_ID=$(az ad app create \
+    --display-name "$APP_NAME" \
+    --sign-in-audience "AzureADMyOrg" \
+    --query appId -o tsv)
+  echo "Created App Registration."
+else
+  echo "App Registration already exists."
+fi
+
+echo "==> Create (or get) Service Principal for the app"
+SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv 2>/dev/null || true)
+if [[ -z "${SP_OBJECT_ID}" ]]; then
+  SP_OBJECT_ID=$(az ad sp create --id "$APP_ID" --query id -o tsv)
+  echo "Created Service Principal."
+else
+  echo "Service Principal already exists."
+fi
+
+TENANT_ID=$(az account show --query tenantId -o tsv)
+
+echo
+echo "=== OUTPUTS (save these for GitHub Secrets) ==="
+echo "AZURE_CLIENT_ID (App ID)     : $APP_ID"
+echo "AZURE_TENANT_ID (Tenant ID)  : $TENANT_ID"
+echo "Service Principal Object ID  : $SP_OBJECT_ID"
+echo "==============================================="
+
+
+###################################################
+# 2 - Give the SP access to your resource group (RBAC)
+# Run in Azure Cloud Shell (Bash).
+###################################################
+
+# --- inputs ---
+SUBSCRIPTION_ID="fff37d4f-d044-4d79-b5aa-b119708ab6ee"
+RG="laravel-rg"
+SP_OBJECT_ID="0af4d286-4e1b-42fe-8b3c-6e4e57aace83"   # from your output
+# --------------
+
+az account set --subscription "$SUBSCRIPTION_ID"
+
+# Easiest: full control of the RG (covers MySQL + Container Apps)
+az role assignment create \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG"
+
+# (Optional: least-privilege instead of full Contributor)
+# az role assignment create --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal \
+#   --role "MySQL Flexible Server Contributor" --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG"
+# az role assignment create --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal \
+#   --role "Container Apps Contributor" --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG"
+
+# Quick check:
+az role assignment list \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG" \
+  -o table
+
+
+###################################################
+# 3 - Add the GitHub federated credential (OIDC) for your repo/branch
+# Run in Azure Cloud Shell (Bash).
+###################################################
+
+# --- inputs ---
+APP_ID="fd69f461-cc6a-4ef9-8294-47451008d8db"   # AZURE_CLIENT_ID from your output
+OWNER="andylelli"                           # e.g., andylelli
+REPO="azure_mysql_202509"                                # e.g., festival-infra
+BRANCH="main"                                   # or whatever branch runs your workflow
+# --------------
+
+APP_OBJECT_ID=$(az ad app show --id "$APP_ID" --query id -o tsv)
+
+cat > fc.json <<'JSON'
+{
+  "name": "github-actions-branch",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:OWNER/REPO:ref:refs/heads/BRANCH",
+  "description": "GitHub Actions OIDC (branch)",
+  "audiences": [ "api://AzureADTokenExchange" ]
+}
+JSON
+
+# inject your owner/repo/branch into the JSON
+sed -i "s/OWNER/$OWNER/g; s/REPO/$REPO/g; s/BRANCH/$BRANCH/g" fc.json
+
+# create the federated credential on the app registration
+az ad app federated-credential create --id "$APP_OBJECT_ID" --parameters @fc.json
+
+
+###################################################
+# 3b - (Optional) Allow more triggers
+# Run in Azure Cloud Shell (Bash).
+###################################################
+
+# For tags (e.g., v1.2.3):
+cat > fc-tags.json <<'JSON'
+{
+  "name": "github-actions-tags",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:OWNER/REPO:ref:refs/tags/*",
+  "description": "GitHub Actions OIDC (tags)",
+  "audiences": [ "api://AzureADTokenExchange" ]
+}
+JSON
+sed -i "s/OWNER/$OWNER/g; s/REPO/$REPO/g" fc-tags.json
+az ad app federated-credential create --id "$APP_OBJECT_ID" --parameters @fc-tags.json
+
+# For pull requests:
+cat > fc-pr.json <<'JSON'
+{
+  "name": "github-actions-pr",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:OWNER/REPO:pull_request",
+  "description": "GitHub Actions OIDC (PRs)",
+  "audiences": [ "api://AzureADTokenExchange" ]
+}
+JSON
+sed -i "s/OWNER/$OWNER/g; s/REPO/$REPO/g" fc-pr.json
+az ad app federated-credential create --id "$APP_OBJECT_ID" --parameters @fc-pr.json
+
+
+###################################################
+# 4 - MySQL 
+# Values only (remove Xs)
+###################################################
+
+XMYSQL_XADMIN_XPASSWORD = DerTbcVqWedY
+XMYSQL_XAPP_XPASSWORD = MeFshjYgfgDF

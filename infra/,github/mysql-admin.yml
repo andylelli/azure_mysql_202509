@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "provision | scale-up | scale-down | stop | start | delete"
+        description: "smoke | provision | scale-up | scale-down | stop | start | delete"
         required: true
         type: choice
-        options: [provision, scale-up, scale-down, stop, start, delete]
+        options: [smoke, provision, scale-up, scale-down, stop, start, delete]
       admin_ip:
         description: "Optional: your public IP to allow direct admin access"
         required: false
@@ -20,8 +20,6 @@ jobs:
       contents: read
     concurrency:
       group: mysql-admin-${{ github.ref }}
-      cancel-in-progress: false
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,7 +35,6 @@ jobs:
         run: |
           set -euxo pipefail
           az extension add -n containerapp --upgrade || true
-          # MySQL Flexible Server commands live in rdbms; some setups still use rdbms-flexible-server — try both.
           az extension add -n rdbms --upgrade || az extension add -n rdbms-flexible-server --upgrade || true
 
       - name: Set environment defaults
@@ -51,7 +48,24 @@ jobs:
             echo "ADMIN_IP=${{ github.event.inputs.admin_ip }}" >> $GITHUB_ENV
           fi
 
+      # ---- Smoke test only (no .sh scripts) ----
+      - name: Smoke test (OIDC & RBAC)
+        run: |
+          set -euxo pipefail
+          echo "== Account =="
+          az account show
+          echo "== Resource group access =="
+          az group show -n "$RG" --query "{name:name,location:location}" -o table
+          echo "== Container Apps Environment =="
+          az containerapp env show -g "$RG" -n "$ENV_NAME" --query "{name:name,location:location}" -o table
+          echo "== Outbound IPs (for firewall rules) =="
+          ENV_ID=$(az containerapp env show -g "$RG" -n "$ENV_NAME" --query id -o tsv)
+          az rest --method get --uri "https://management.azure.com${ENV_ID}?api-version=2025-01-01" \
+            --query "properties.outboundIpAddresses"
+
+      # Skip all provisioning/scaling steps if action == smoke
       - name: Execute action
+        if: ${{ inputs.action != 'smoke' }}
         env:
           MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
           MYSQL_APP_PASSWORD:   ${{ secrets.MYSQL_APP_PASSWORD }}
