@@ -16,7 +16,7 @@ BACKUP_DAYS="${BACKUP_DAYS:-7}"                 # 1-35
 DB_NAME="${DB_NAME:-laravel}"
 APP_USER="${APP_USER:-appuser}"
 ADMIN_USER="${ADMIN_USER:-mysqladmin}"          # Azure forms login as 'mysqladmin'
-ADMIN_IP="${ADMIN_IP:-}"                        # optional: your public IP
+ADMIN_IP="${ADMIN_IP:-}"                        # optional: your public IP (firewall)
 
 # App/Env
 APP_NAME="${APP_NAME:-laravel-aca}"
@@ -58,6 +58,10 @@ if ! az mysql flexible-server show -g "$RG" -n "$SERVER" >/dev/null 2>&1; then
     --yes
 fi
 
+# NEW: ensure Public Network Access is Enabled (we created with None)
+echo "==> Ensure Public Network Access is Enabled"
+az mysql flexible-server update -g "$RG" -n "$SERVER" --public-network-access Enabled >/dev/null
+
 echo "==> Enforce TLS"
 az mysql flexible-server parameter set -g "$RG" -s "$SERVER" \
   --name require_secure_transport --value ON >/dev/null
@@ -73,19 +77,43 @@ for ip in "${ACA_IPS[@]}"; do
   i=$((i+1))
 done
 
+# Optional admin IP rule (your laptop, if provided)
 if [[ -n "${ADMIN_IP}" ]]; then
   az mysql flexible-server firewall-rule create -g "$RG" -s "$SERVER" \
     --name "admin-ip" --start-ip-address "$ADMIN_IP" --end-ip-address "$ADMIN_IP" >/dev/null || true
 fi
 
-echo "==> Create DB and least-privileged app user"
+echo "==> Create DB (idempotent)"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
-# Install preview helper non-interactively (safe if already set)
+# Prepare to temporarily open firewall for the GitHub runner's public IP (for the SQL step)
+TEMP_RULE=""
+cleanup() {
+  if [[ -n "$TEMP_RULE" ]]; then
+    az mysql flexible-server firewall-rule delete -g "$RG" -s "$SERVER" -n "$TEMP_RULE" --yes >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+# Try to detect the runner IP if ADMIN_IP not provided
+if [[ -z "${ADMIN_IP}" ]]; then
+  echo "==> Detect runner public IP for temporary firewall rule"
+  MYIP="$(curl -fsS https://ifconfig.me 2>/dev/null || curl -fsS https://api.ipify.org 2>/dev/null || true)"
+  if [[ -n "$MYIP" ]]; then
+    TEMP_RULE="gha-$(date +%s)"
+    echo "   Detected IP: $MYIP -> creating rule $TEMP_RULE"
+    az mysql flexible-server firewall-rule create -g "$RG" -s "$SERVER" \
+      --name "$TEMP_RULE" --start-ip-address "$MYIP" --end-ip-address "$MYIP" >/dev/null || true
+  else
+    echo "   Could not detect runner IP. If this step fails, re-run with 'admin_ip' input set."
+  fi
+fi
+
+echo "==> Create least-privileged app user (via SQL)"
+# Ensure CLI can install helper extension non-interactively
 az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
 az config set extension.dynamic_install_allow_preview=true >/dev/null
 
-# Execute SQL (FIXED: no --resource-group here)
 SQL="
 CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';
