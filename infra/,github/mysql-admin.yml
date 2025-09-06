@@ -37,6 +37,9 @@ jobs:
           set -euxo pipefail
           az extension add -n containerapp --upgrade || true
           az extension add -n rdbms --upgrade || az extension add -n rdbms-flexible-server --upgrade || true
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az config set extension.dynamic_install_allow_preview=true
+
 
       - name: Set environment defaults
         run: |

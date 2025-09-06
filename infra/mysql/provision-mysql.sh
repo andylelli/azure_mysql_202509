@@ -81,13 +81,20 @@ fi
 echo "==> Create DB and least-privileged app user"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
+# Execute SQL — FIXED: use --name/-n (required by this subcommand) and include DB name for clarity
 SQL="
 CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';
 FLUSH PRIVILEGES;
 "
-az mysql flexible-server execute -g "$RG" -s "$SERVER" \
-  --admin-user "$ADMIN_USER" --admin-password "$MYSQL_ADMIN_PASSWORD" \
+az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
+az config set extension.dynamic_install_allow_preview=true >/dev/null
+az mysql flexible-server execute \
+  --name "$SERVER" \
+  --resource-group "$RG" \
+  --admin-user "$ADMIN_USER" \
+  --admin-password "$MYSQL_ADMIN_PASSWORD" \
+  --database-name "$DB_NAME" \
   --querytext "$SQL" >/dev/null
 
 echo "==> Wire Container App secrets + env"
