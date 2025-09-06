@@ -6,21 +6,34 @@ RG="${RG:-laravel-rg}"
 LOC="${LOC:-uksouth}"
 SERVER="${SERVER:-fest-db}"                     # unique, lowercase, 3-63 chars
 MYSQL_VERSION="${MYSQL_VERSION:-8.0}"
-SKU_NAME="${SKU_NAME:-Standard_D2ds_v5}"        # festival-size default; use Standard_B1ms off-season
+SKU_NAME="${SKU_NAME:-Standard_D2ds_v5}"        # GP default; pass Standard_B1ms for Burstable
+TIER="${TIER:-}"                                # Burstable | GeneralPurpose | BusinessCritical (auto-inferred if empty)
 STORAGE_GB="${STORAGE_GB:-20}"                  # min 20; can only increase later
 BACKUP_DAYS="${BACKUP_DAYS:-7}"                 # 1-35
-MAINT_POLICY="${MAINT_POLICY:-system}"          # system or leave for portal control
+MAINT_POLICY="${MAINT_POLICY:-system}"          # kept for future use
 DB_NAME="${DB_NAME:-laravel}"
 APP_USER="${APP_USER:-appuser}"
 ADMIN_USER="${ADMIN_USER:-mysqladmin}"          # Azure forms login as 'mysqladmin' (not mysqladmin@server in CLI)
 ADMIN_IP="${ADMIN_IP:-}"                        # e.g. your workstation public IP (optional)
 
-# Secrets must come from CI/CD (masked)
+# App/Env
+APP_NAME="${APP_NAME:-laravel-aca}"
+ENV_NAME="${ENV_NAME:-laravel-env}"
+
+# --- Secrets (required) ---
 : "${MYSQL_ADMIN_PASSWORD:?Missing MYSQL_ADMIN_PASSWORD}"
 : "${MYSQL_APP_PASSWORD:?Missing MYSQL_APP_PASSWORD}"
 
-APP_NAME="${APP_NAME:-laravel-aca}"
-ENV_NAME="${ENV_NAME:-laravel-env}"
+# --- Infer TIER from SKU if not provided ---
+if [[ -z "${TIER}" ]]; then
+  case "$SKU_NAME" in
+    Standard_B*) TIER="Burstable" ;;
+    Standard_D*|GP*) TIER="GeneralPurpose" ;;
+    Standard_E*|BC*) TIER="BusinessCritical" ;;
+    *) TIER="Burstable" ;;  # safe default
+  esac
+fi
+echo "==> Effective tier: $TIER, SKU: $SKU_NAME"
 
 echo "==> Ensure server exists (or create)"
 if ! az mysql flexible-server show -g "$RG" -n "$SERVER" >/dev/null 2>&1; then
@@ -28,7 +41,7 @@ if ! az mysql flexible-server show -g "$RG" -n "$SERVER" >/dev/null 2>&1; then
     --resource-group "$RG" --name "$SERVER" --location "$LOC" \
     --admin-user "$ADMIN_USER" --admin-password "$MYSQL_ADMIN_PASSWORD" \
     --version "$MYSQL_VERSION" \
-    --sku-name "$SKU_NAME" \
+    --tier "$TIER" --sku-name "$SKU_NAME" \
     --storage-size "$STORAGE_GB" \
     --backup-retention "$BACKUP_DAYS" \
     --public-access None \
@@ -58,7 +71,7 @@ fi
 echo "==> Create DB and least-privileged app user"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
-# Use CLI 'execute' extension to run SQL without exposing creds in logs
+# (Exactly like your original execute section)
 SQL="
 CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';
@@ -70,6 +83,7 @@ az mysql flexible-server execute -g "$RG" -s "$SERVER" \
 
 echo "==> Wire Container App secrets + env"
 HOST=$(az mysql flexible-server show -g "$RG" -n "$SERVER" --query fullyQualifiedDomainName -o tsv)
+
 az containerapp secret set -g "$RG" -n "$APP_NAME" --secrets \
   db-host="$HOST" db-database="$DB_NAME" db-username="$APP_USER" db-password="$MYSQL_APP_PASSWORD" >/dev/null
 

@@ -72,14 +72,15 @@ jobs:
           set -euo pipefail
           case "${{ inputs.action }}" in
             provision)
-              # Create in Burstable (matches default tier) to avoid mismatch
-              SKU_NAME=Standard_B1ms bash infra/mysql/provision-mysql.sh
+              # Create as Burstable to match default tier (no mismatch), script also infers tier from SKU
+              SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              # Explicitly set tier when moving to a GP SKU
+              # Move to General Purpose explicitly (short restart)
               TIER=GeneralPurpose TARGET_SKU=Standard_D2ds_v5 bash infra/mysql/scale-mysql.sh
               ;;
             scale-down)
+              # Back to Burstable (short restart)
               TIER=Burstable TARGET_SKU=Standard_B1ms bash infra/mysql/scale-mysql.sh
               ;;
             stop)
