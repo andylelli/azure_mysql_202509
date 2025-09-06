@@ -72,11 +72,11 @@ jobs:
           set -euo pipefail
           case "${{ inputs.action }}" in
             provision)
-              # Create as Burstable (script also infers tier from SKU)
-              SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
+              # Version must be exact. Use 8.4 (MySQL LTS) to avoid the 8.0 vs 8.0.21 mismatch.
+              MYSQL_VERSION=8.4 SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              # Use an allowed GP SKU in UK South
+              # Allowed GP SKU in UK South
               TIER=GeneralPurpose TARGET_SKU=Standard_D2ads_v5 bash infra/mysql/scale-mysql.sh
               ;;
             scale-down)
