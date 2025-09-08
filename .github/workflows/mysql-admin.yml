@@ -37,6 +37,8 @@ jobs:
           set -euxo pipefail
           az extension add -n containerapp --upgrade || true
           az extension add -n rdbms --upgrade || az extension add -n rdbms-flexible-server --upgrade || true
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az config set extension.dynamic_install_allow_preview=true
 
       - name: Set environment defaults
         run: |
@@ -63,6 +65,41 @@ jobs:
           az rest --method get --uri "https://management.azure.com${ENV_ID}?api-version=2025-01-01" \
             --query "properties.outboundIpAddresses"
 
+      # One-time per subscription (idempotent)
+      - name: Ensure Microsoft.DBforMySQL provider is registered
+        run: |
+          set -euo pipefail
+          STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "NotRegistered")
+          echo "Microsoft.DBforMySQL registrationState=${STATE}"
+          if [ "$STATE" != "Registered" ]; then
+            echo "Attempting to register Microsoft.DBforMySQL..."
+            if az provider register --namespace Microsoft.DBforMySQL >/dev/null 2>&1; then
+              for i in {1..30}; do
+                sleep 5
+                STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "NotRegistered")
+                echo "registrationState=${STATE}"
+                [ "$STATE" = "Registered" ] && break
+              done
+            else
+              echo "::error::Failed to request provider registration. This usually means the service principal does not have subscription-level permission. Ask a Subscription Owner to register 'Microsoft.DBforMySQL' or grant this SP a role at subscription scope."
+              echo "Portal quick link: https://portal.azure.com/#view/Microsoft_Azure_Resources/ProviderMenuBlade/~/Microsoft.DBforMySQL"
+              exit 1
+            fi
+            if [ "$STATE" != "Registered" ]; then
+              echo "::error::Microsoft.DBforMySQL is still not Registered. Please register in the Azure Portal, then re-run."
+              echo "Portal quick link: https://portal.azure.com/#view/Microsoft_Azure_Resources/ProviderMenuBlade/~/Microsoft.DBforMySQL"
+              exit 1
+            fi
+          fi
+
+      - name: Bash syntax check
+        run: |
+          bash -n infra/mysql/provision-mysql.sh
+          bash -n infra/mysql/scale-up.sh
+          bash -n infra/mysql/scale-down.sh
+          bash -n infra/mysql/stop-start-mysql.sh
+          bash -n infra/mysql/delete-mysql.sh
+
       - name: Execute action
         if: ${{ inputs.action != 'smoke' }}
         env:
@@ -72,13 +109,16 @@ jobs:
           set -euo pipefail
           case "${{ inputs.action }}" in
             provision)
-              bash infra/mysql/provision-mysql.sh
+              # Exact version + Burstable (script infers tier)
+              MYSQL_VERSION=8.4 SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              TARGET_SKU=Standard_D2ds_v5 bash infra/mysql/scale-mysql.sh
+              # Use separate UP script (GP tier) 
+              TIER=GeneralPurpose TARGET_SKU=Standard_D2ads_v5 bash infra/mysql/scale-up.sh
               ;;
             scale-down)
-              TARGET_SKU=Standard_B1ms bash infra/mysql/scale-mysql.sh
+              # Use separate DOWN script (Burstable)
+              TIER=Burstable TARGET_SKU=Standard_B1ms bash infra/mysql/scale-down.sh
               ;;
             stop)
               bash infra/mysql/stop-start-mysql.sh stop
