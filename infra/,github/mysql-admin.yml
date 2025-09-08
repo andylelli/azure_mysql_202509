@@ -113,7 +113,7 @@ jobs:
               MYSQL_VERSION=8.4 SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              # Use separate UP script (GP tier)
+              # Use separate UP script (GP tier) 
               TIER=GeneralPurpose TARGET_SKU=Standard_D2ads_v5 bash infra/mysql/scale-up.sh
               ;;
             scale-down)
