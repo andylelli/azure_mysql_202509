@@ -40,7 +40,6 @@ jobs:
           az config set extension.use_dynamic_install=yes_without_prompt
           az config set extension.dynamic_install_allow_preview=true
 
-
       - name: Set environment defaults
         run: |
           echo "RG=laravel-rg" >> $GITHUB_ENV
@@ -66,8 +65,7 @@ jobs:
           az rest --method get --uri "https://management.azure.com${ENV_ID}?api-version=2025-01-01" \
             --query "properties.outboundIpAddresses"
 
-      # Ensure the subscription is registered for MySQL (one-time per subscription).
-      # If the SP lacks subscription-level permission, we fail fast with a helpful message.
+      # One-time per subscription (idempotent)
       - name: Ensure Microsoft.DBforMySQL provider is registered
         run: |
           set -euo pipefail
@@ -94,6 +92,14 @@ jobs:
             fi
           fi
 
+      - name: Bash syntax check
+        run: |
+          bash -n infra/mysql/provision-mysql.sh
+          bash -n infra/mysql/scale-up.sh
+          bash -n infra/mysql/scale-down.sh
+          bash -n infra/mysql/stop-start-mysql.sh
+          bash -n infra/mysql/delete-mysql.sh
+
       - name: Execute action
         if: ${{ inputs.action != 'smoke' }}
         env:
@@ -103,15 +109,16 @@ jobs:
           set -euo pipefail
           case "${{ inputs.action }}" in
             provision)
-              # Use exact version string (8.4 LTS) + Burstable SKU; script infers/uses TIER.
+              # Exact version + Burstable (script infers tier)
               MYSQL_VERSION=8.4 SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
               ;;
             scale-up)
-              # Allowed GP SKU in UK South for MySQL Flexible Server (short restart)
-              TIER=GeneralPurpose TARGET_SKU=Standard_D2ads_v5 bash infra/mysql/scale-mysql.sh
+              # Use separate UP script (GP tier)
+              TIER=GeneralPurpose TARGET_SKU=Standard_D2ads_v5 bash infra/mysql/scale-up.sh
               ;;
             scale-down)
-              TIER=Burstable TARGET_SKU=Standard_B1ms bash infra/mysql/scale-mysql.sh
+              # Use separate DOWN script (Burstable)
+              TIER=Burstable TARGET_SKU=Standard_B1ms bash infra/mysql/scale-down.sh
               ;;
             stop)
               bash infra/mysql/stop-start-mysql.sh stop
