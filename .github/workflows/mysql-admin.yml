@@ -4,23 +4,49 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "smoke | provision | scale-up | scale-down | stop | start | delete"
+        description: "Action to perform"
         required: true
+        default: "smoke"
         type: choice
-        options: [smoke, provision, scale-up, scale-down, stop, start, delete]
-      admin_ip:
-        description: "Optional: your public IP to allow direct admin access"
+        options:
+          - smoke
+          - provision
+          - scale-up
+          - scale-down
+          - stop
+          - start
+          - delete
+          - migrate
+      run_migrations:
+        description: "Run php artisan migrate --force after 'provision'"
         required: false
+        default: "false"
+        type: choice
+        options: ["true","false"]
+      maintenance_mode:
+        description: "Put Laravel in maintenance mode during 'migrate'"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true","false"]
+
+concurrency:
+  group: mysql-admin-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AZURE_RG: laravel-rg
+  ACA_NAME: laravel-aca
+  MYSQL_INFRA_DIR: infra/mysql
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  run:
+  smoke:
+    if: ${{ github.event.inputs.action == 'smoke' }}
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    concurrency:
-      group: mysql-admin-${{ github.ref }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,108 +55,274 @@ jobs:
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id:  ${{ secrets.AZURE_TENANT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Prepare Azure CLI
-        run: |
-          set -euxo pipefail
-          az extension add -n containerapp --upgrade || true
-          az extension add -n rdbms --upgrade || az extension add -n rdbms-flexible-server --upgrade || true
-          az config set extension.use_dynamic_install=yes_without_prompt
-          az config set extension.dynamic_install_allow_preview=true
-
-      - name: Set environment defaults
-        run: |
-          echo "RG=laravel-rg" >> $GITHUB_ENV
-          echo "LOC=uksouth" >> $GITHUB_ENV
-          echo "ENV_NAME=laravel-env" >> $GITHUB_ENV
-          echo "APP_NAME=laravel-aca" >> $GITHUB_ENV
-          echo "SERVER=fest-db" >> $GITHUB_ENV
-          if [ -n "${{ github.event.inputs.admin_ip }}" ]; then
-            echo "ADMIN_IP=${{ github.event.inputs.admin_ip }}" >> $GITHUB_ENV
-          fi
-
-      - name: Smoke test (OIDC & RBAC only)
-        run: |
-          set -euxo pipefail
-          echo "== Account =="
-          az account show
-          echo "== Resource group access =="
-          az group show -n "$RG" --query "{name:name,location:location}" -o table
-          echo "== Container Apps Environment =="
-          az containerapp env show -g "$RG" -n "$ENV_NAME" --query "{name:name,location:location}" -o table
-          echo "== Outbound IPs (for firewall rules) =="
-          ENV_ID=$(az containerapp env show -g "$RG" -n "$ENV_NAME" --query id -o tsv)
-          az rest --method get --uri "https://management.azure.com${ENV_ID}?api-version=2025-01-01" \
-            --query "properties.outboundIpAddresses"
-
-      # One-time per subscription (idempotent)
-      - name: Ensure Microsoft.DBforMySQL provider is registered
+      - name: Verify Azure provider registrations
         run: |
           set -euo pipefail
-          STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "NotRegistered")
-          echo "Microsoft.DBforMySQL registrationState=${STATE}"
-          if [ "$STATE" != "Registered" ]; then
-            echo "Attempting to register Microsoft.DBforMySQL..."
-            if az provider register --namespace Microsoft.DBforMySQL >/dev/null 2>&1; then
-              for i in {1..30}; do
-                sleep 5
-                STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "NotRegistered")
-                echo "registrationState=${STATE}"
-                [ "$STATE" = "Registered" ] && break
-              done
-            else
-              echo "::error::Failed to request provider registration. This usually means the service principal does not have subscription-level permission. Ask a Subscription Owner to register 'Microsoft.DBforMySQL' or grant this SP a role at subscription scope."
-              echo "Portal quick link: https://portal.azure.com/#view/Microsoft_Azure_Resources/ProviderMenuBlade/~/Microsoft.DBforMySQL"
-              exit 1
-            fi
-            if [ "$STATE" != "Registered" ]; then
-              echo "::error::Microsoft.DBforMySQL is still not Registered. Please register in the Azure Portal, then re-run."
-              echo "Portal quick link: https://portal.azure.com/#view/Microsoft_Azure_Resources/ProviderMenuBlade/~/Microsoft.DBforMySQL"
-              exit 1
-            fi
-          fi
+          az provider register --namespace Microsoft.App --wait
+          az provider register --namespace Microsoft.DBforMySQL --wait
 
-      - name: Bash syntax check
+      - name: Verify resource group and Container Apps env
         run: |
-          bash -n infra/mysql/provision-mysql.sh
-          bash -n infra/mysql/scale-up.sh
-          bash -n infra/mysql/scale-down.sh
-          bash -n infra/mysql/stop-start-mysql.sh
-          bash -n infra/mysql/delete-mysql.sh
+          set -euo pipefail
+          az group show -n "$AZURE_RG" -o table
+          az containerapp env list -g "$AZURE_RG" -o table || true
 
-      - name: Execute action
-        if: ${{ inputs.action != 'smoke' }}
+      - name: Show Container App and public URL
+        run: |
+          set -euo pipefail
+          az containerapp show -g "$AZURE_RG" -n "$ACA_NAME" \
+            --query "{name:name,ingress:configuration.ingress.fqdn,activeRev:properties.latestRevisionName}" -o yaml || true
+
+      - name: List Container App outbound IPs
+        run: |
+          set -euo pipefail
+          az containerapp show -g "$AZURE_RG" -n "$ACA_NAME" \
+            --query "properties.outboundIpAddresses" -o tsv || true
+
+  provision:
+    if: ${{ github.event.inputs.action == 'provision' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure Azure providers are registered
+        run: |
+          set -euo pipefail
+          az provider register --namespace Microsoft.DBforMySQL --wait
+
+      - name: Provision MySQL Flexible Server + DB + user + firewall + secrets
+        run: |
+          set -euo pipefail
+          bash "$MYSQL_INFRA_DIR/provision-mysql.sh"
+
+      # ✅ Step 2: optionally run Laravel migrations immediately after provisioning
+      - name: Run migrations in Container App
+        if: ${{ github.event.inputs.run_migrations == 'true' }}
+        run: |
+          set -euo pipefail
+          # Ensure an active revision exists (no-op if already healthy)
+          az containerapp revision list \
+            --resource-group "$AZURE_RG" \
+            --name "$ACA_NAME" \
+            --query "[?properties.active==\`true\`].name" -o tsv
+          # Run DB migrations and warm caches
+          az containerapp exec \
+            --resource-group "$AZURE_RG" \
+            --name "$ACA_NAME" \
+            --command "php artisan migrate --force && php artisan config:clear && php artisan cache:clear && php artisan route:cache && php artisan event:cache"
+
+  scale-up:
+    if: ${{ github.event.inputs.action == 'scale-up' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Scale MySQL up (GP 2 vCPU / 8 GB)
+        run: |
+          set -euo pipefail
+          bash "$MYSQL_INFRA_DIR/scale-up.sh"
+
+  scale-down:
+    if: ${{ github.event.inputs.action == 'scale-down' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Scale MySQL down (Burstable smallest available)
+        run: |
+          set -euo pipefail
+          bash "$MYSQL_INFRA_DIR/scale-down.sh"
+
+  stop:
+    if: ${{ github.event.inputs.action == 'stop' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Stop MySQL Flexible Server
+        run: |
+          set -euo pipefail
+          bash "$MYSQL_INFRA_DIR/stop-start-mysql.sh" stop
+
+  start:
+    if: ${{ github.event.inputs.action == 'start' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Start MySQL Flexible Server
+        run: |
+          set -euo pipefail
+          bash "$MYSQL_INFRA_DIR/stop-start-mysql.sh" start
+
+  delete:
+    if: ${{ github.event.inputs.action == 'delete' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Delete MySQL Flexible Server (idempotent)
+        run: |
+          set -euo pipefail
+          bash "$MYSQL_INFRA_DIR/delete-mysql.sh"
+
+  migrate:
+    if: ${{ github.event.inputs.action == 'migrate' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install MySQL client + jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client jq
+
+      - name: Allow runner IP on Azure MySQL (temporary)
+        run: |
+          set -euo pipefail
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          az mysql flexible-server firewall-rule create \
+            -g "$AZURE_RG" \
+            -n fest-db \
+            --rule-name gha-runner \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP"
+
+      - name: (Optional) put app in maintenance mode
+        if: ${{ github.event.inputs.maintenance_mode == 'true' }}
+        run: |
+          az containerapp exec \
+            --resource-group "$AZURE_RG" \
+            --name "$ACA_NAME" \
+            --command "php artisan down --render='errors::503' || true"
+
+      - name: Dump from Cloudways (online, consistent)
         env:
-          MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
-          MYSQL_APP_PASSWORD:   ${{ secrets.MYSQL_APP_PASSWORD }}
+          # Expect these repo secrets to exist:
+          # CW_DB_HOST=161.35.36.63, CW_DB_PORT=3306, CW_DB_NAME=gthewnsykf, CW_DB_USER=gthewnsykf, CW_DB_PASSWORD=<secret>
+          CW_DB_HOST: ${{ secrets.CW_DB_HOST }}
+          CW_DB_PORT: ${{ secrets.CW_DB_PORT }}
+          CW_DB_NAME: ${{ secrets.CW_DB_NAME }}
+          CW_DB_USER: ${{ secrets.CW_DB_USER }}
+          CW_DB_PASSWORD: ${{ secrets.CW_DB_PASSWORD }}
         run: |
           set -euo pipefail
-          case "${{ inputs.action }}" in
-            provision)
-              # Exact version + Burstable (script infers tier)
-              MYSQL_VERSION=8.4 SKU_NAME=Standard_B1ms TIER=Burstable bash infra/mysql/provision-mysql.sh
-              ;;
-            scale-up)
-              # Use separate UP script (GP tier) 
-              TIER=GeneralPurpose TARGET_SKU=Standard_D2ads_v5 bash infra/mysql/scale-up.sh
-              ;;
-            scale-down)
-              # Use separate DOWN script (Burstable)
-              TIER=Burstable TARGET_SKU=Standard_B1ms bash infra/mysql/scale-down.sh
-              ;;
-            stop)
-              bash infra/mysql/stop-start-mysql.sh stop
-              ;;
-            start)
-              bash infra/mysql/stop-start-mysql.sh start
-              ;;
-            delete)
-              bash infra/mysql/delete-mysql.sh
-              ;;
-            *)
-              echo "Unknown action: ${{ inputs.action }}" >&2
-              exit 1
-              ;;
-          esac
+          mysqldump \
+            --host="${CW_DB_HOST}" --port="${CW_DB_PORT:-3306}" \
+            --user="${CW_DB_USER}" --password="${CW_DB_PASSWORD}" \
+            --databases "${CW_DB_NAME}" \
+            --single-transaction --quick --lock-tables=0 \
+            --routines --triggers --events \
+            --hex-blob --default-character-set=utf8mb4 \
+            --set-gtid-purged=OFF --column-statistics=0 --no-tablespaces \
+            --skip-comments \
+          | sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g' \
+          | gzip -c > dump.sql.gz
+          ls -lh dump.sql.gz
+
+      - name: Import into Azure MySQL (TLS)
+        env:
+          AZ_MYSQL_HOST: fest-db.mysql.database.azure.com
+          AZ_MYSQL_DB: laravel
+          AZ_MYSQL_USER: appuser@fest-db
+          AZ_MYSQL_PASSWORD: ${{ secrets.MYSQL_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Ensure target DB exists (no-op if already present)
+          mysql --host="$AZ_MYSQL_HOST" --user="$AZ_MYSQL_USER" --password="$AZ_MYSQL_PASSWORD" --ssl-mode=REQUIRED -e "CREATE DATABASE IF NOT EXISTS \`${AZ_MYSQL_DB}\`;"
+          zcat dump.sql.gz | mysql \
+            --host="$AZ_MYSQL_HOST" \
+            --user="$AZ_MYSQL_USER" \
+            --password="$AZ_MYSQL_PASSWORD" \
+            --ssl-mode=REQUIRED
+
+      - name: Post-import sanity checks (row counts)
+        env:
+          AZ_MYSQL_HOST: fest-db.mysql.database.azure.com
+          AZ_MYSQL_DB: laravel
+          AZ_MYSQL_USER: appuser@fest-db
+          AZ_MYSQL_PASSWORD: ${{ secrets.MYSQL_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mysql --host="$AZ_MYSQL_HOST" --user="$AZ_MYSQL_USER" --password="$AZ_MYSQL_PASSWORD" --ssl-mode=REQUIRED -N -e "
+          SELECT CONCAT('SELECT ''', table_name, ''' AS tbl, COUNT(*) AS cnt FROM \`', table_schema, '\`.\`', table_name, '\`;')
+          FROM information_schema.tables
+          WHERE table_schema='${AZ_MYSQL_DB}' AND table_type='BASE TABLE';
+          " | mysql --host="$AZ_MYSQL_HOST" --user="$AZ_MYSQL_USER" --password="$AZ_MYSQL_PASSWORD" --ssl-mode=REQUIRED -N > counts.txt
+          echo 'Counts on Azure:' && cat counts.txt
+
+      - name: Run Laravel migrations + cache warmup
+        run: |
+          az containerapp exec \
+            --resource-group "$AZURE_RG" \
+            --name "$ACA_NAME" \
+            --command "php artisan migrate --force && php artisan config:clear && php artisan cache:clear && php artisan route:cache"
+
+      - name: Bring app back up
+        if: ${{ github.event.inputs.maintenance_mode == 'true' }}
+        run: |
+          az containerapp exec \
+            --resource-group "$AZURE_RG" \
+            --name "$ACA_NAME" \
+            --command "php artisan up || true"
+
+      - name: Cleanup firewall rule
+        if: always()
+        run: |
+          az mysql flexible-server firewall-rule delete \
+            -g "$AZURE_RG" \
+            -n fest-db \
+            --rule-name gha-runner \
+            --yes
