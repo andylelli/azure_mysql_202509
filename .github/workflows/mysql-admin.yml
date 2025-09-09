@@ -37,10 +37,11 @@ concurrency:
 env:
   AZURE_RG: laravel-rg
   ACA_NAME: laravel-aca
+  # Adjust if needed:
   MYSQL_INFRA_DIR: infra/mysql
 
 permissions:
-  id-token: write
+  id-token: write   # for azure/login OIDC
   contents: read
 
 jobs:
@@ -111,19 +112,30 @@ jobs:
           fi
 
       - name: Provision MySQL Flexible Server + DB + user + firewall + secrets
+        env:
+          # required by your script
+          MYSQL_ADMIN_PASSWORD: ${{ secrets.MYSQL_ADMIN_PASSWORD }}
+          MYSQL_APP_PASSWORD:   ${{ secrets.MYSQL_APP_PASSWORD }}
+          # known values for your environment (adjust if your script uses different var names)
+          MYSQL_SERVER_NAME: fest-db
+          MYSQL_DB_NAME:     laravel
+          MYSQL_APP_USER:    appuser
+          AZURE_RG:          ${{ env.AZURE_RG }}
         run: |
           set -euo pipefail
           bash "$MYSQL_INFRA_DIR/provision-mysql.sh"
 
-      # ✅ Step 2: optionally run Laravel migrations immediately after provisioning
+      # ✅ Optional: run Laravel migrations right after provisioning
       - name: Run migrations in Container App
         if: ${{ github.event.inputs.run_migrations == 'true' }}
         run: |
           set -euo pipefail
+          # Ensure an active revision exists (no-op if already healthy)
           az containerapp revision list \
             --resource-group "$AZURE_RG" \
             --name "$ACA_NAME" \
             --query "[?properties.active==\`true\`].name" -o tsv
+          # Run DB migrations and warm caches
           az containerapp exec \
             --resource-group "$AZURE_RG" \
             --name "$ACA_NAME" \
