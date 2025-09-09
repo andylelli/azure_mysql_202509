@@ -135,11 +135,12 @@ jobs:
             --resource-group "$AZURE_RG" \
             --name "$ACA_NAME" \
             --query "[?properties.active==\`true\`].name" -o tsv
-          # Run DB migrations and warm caches
-          az containerapp exec \
-            --resource-group "$AZURE_RG" \
-            --name "$ACA_NAME" \
-            --command "php artisan migrate --force && php artisan config:clear && php artisan cache:clear && php artisan route:cache && php artisan event:cache"
+          # Wrap each exec with a TTY to avoid CI ioctl error
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan migrate --force'" /dev/null
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan config:clear'" /dev/null
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan cache:clear'" /dev/null
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan route:cache'" /dev/null
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan event:cache'" /dev/null
 
   scale-up:
     if: ${{ github.event.inputs.action == 'scale-up' }}
@@ -262,10 +263,7 @@ jobs:
       - name: (Optional) put app in maintenance mode
         if: ${{ github.event.inputs.maintenance_mode == 'true' }}
         run: |
-          az containerapp exec \
-            --resource-group "$AZURE_RG" \
-            --name "$ACA_NAME" \
-            --command "php artisan down --render='errors::503' || true"
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan down --render=errors::503 || true'" /dev/null
 
       - name: Dump from Cloudways (online, consistent)
         env:
@@ -324,18 +322,15 @@ jobs:
 
       - name: Run Laravel migrations + cache warmup
         run: |
-          az containerapp exec \
-            --resource-group "$AZURE_RG" \
-            --name "$ACA_NAME" \
-            --command "php artisan migrate --force && php artisan config:clear && php artisan cache:clear && php artisan route:cache"
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan migrate --force'" /dev/null
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan config:clear'" /dev/null
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan cache:clear'" /dev/null
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan route:cache'" /dev/null
 
       - name: Bring app back up
         if: ${{ github.event.inputs.maintenance_mode == 'true' }}
         run: |
-          az containerapp exec \
-            --resource-group "$AZURE_RG" \
-            --name "$ACA_NAME" \
-            --command "php artisan up || true"
+          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan up || true'" /dev/null
 
       - name: Cleanup firewall rule
         if: always()
