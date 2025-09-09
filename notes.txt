@@ -171,3 +171,12 @@ az provider register --namespace Microsoft.DBforMySQL
 while [ "$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv)" != "Registered" ]; do
   echo "Waiting for Microsoft.DBforMySQL registration..."; sleep 5
 done
+
+
+###################################################
+# 7 - Manually registered the Microsoft.DBforMySQL resource provider at the subscription level so workflows with RG-scoped permissions can manage MySQL resources 
+# Run in Azure Cloud Shell (Bash).
+###################################################
+
+az account set --subscription fff37d4f-d044-4d79-b5aa-b119708ab6ee
+az provider register --namespace Microsoft.DBforMySQL

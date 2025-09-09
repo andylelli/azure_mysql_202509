@@ -58,11 +58,15 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Verify Azure provider registrations
+      - name: Check MySQL RP registration (read-only)
         run: |
           set -euo pipefail
-          az provider register --namespace Microsoft.App --wait
-          az provider register --namespace Microsoft.DBforMySQL --wait
+          STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "Unknown")
+          echo "Microsoft.DBforMySQL registrationState: $STATE"
+          if [ "$STATE" != "Registered" ]; then
+            echo "❌ Microsoft.DBforMySQL is not Registered at the subscription. Please register it once (Portal or CLI) and rerun."
+            exit 1
+          fi
 
       - name: Verify resource group and Container Apps env
         run: |
@@ -96,10 +100,15 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Ensure Azure providers are registered
+      - name: Check MySQL RP registration (read-only)
         run: |
           set -euo pipefail
-          az provider register --namespace Microsoft.DBforMySQL --wait
+          STATE=$(az provider show -n Microsoft.DBforMySQL --query registrationState -o tsv || echo "Unknown")
+          echo "Microsoft.DBforMySQL registrationState: $STATE"
+          if [ "$STATE" != "Registered" ]; then
+            echo "❌ Microsoft.DBforMySQL is not Registered at the subscription. Please register it once (Portal or CLI) and rerun."
+            exit 1
+          fi
 
       - name: Provision MySQL Flexible Server + DB + user + firewall + secrets
         run: |
@@ -111,12 +120,10 @@ jobs:
         if: ${{ github.event.inputs.run_migrations == 'true' }}
         run: |
           set -euo pipefail
-          # Ensure an active revision exists (no-op if already healthy)
           az containerapp revision list \
             --resource-group "$AZURE_RG" \
             --name "$ACA_NAME" \
             --query "[?properties.active==\`true\`].name" -o tsv
-          # Run DB migrations and warm caches
           az containerapp exec \
             --resource-group "$AZURE_RG" \
             --name "$ACA_NAME" \
