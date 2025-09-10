@@ -76,7 +76,7 @@ chmod 600 "\$HOME/.my_cw.cnf"
 EOF
 
 echo "📥 Dumping database '${CW_DB_NAME}' from Cloudways over SSH..."
-# Stream dump over SSH -> scrub DEFINER -> gzip -> local file
+# NOTE: removed --set-gtid-purged and --column-statistics for MariaDB/older MySQL compatibility
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
   "${CW_SSH_USER}@${CW_SSH_HOST}" "
     set -euo pipefail
@@ -86,7 +86,7 @@ ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
       --single-transaction --quick --lock-tables=0 \
       --routines --triggers --events \
       --hex-blob \
-      --set-gtid-purged=OFF --column-statistics=0 --no-tablespaces \
+      --no-tablespaces \
       --skip-comments
   " \
 | sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g' \
