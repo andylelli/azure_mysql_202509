@@ -6,7 +6,7 @@ set -euo pipefail
 : "${ACA_NAME:?}"            # e.g. laravel-aca
 
 # Cloudways (source)
-: "${CW_DB_NAME:?}"          # e.g. gthewnsykf
+: "${CW_DB_NAME:?}"          # e.g. gthewnsykf (source DB)
 : "${CW_DB_USER:?}"          # e.g. gthewnsykf
 : "${CW_DB_PASSWORD:?}"      # Cloudways DB password
 : "${CW_SSH_HOST:?}"         # Cloudways server public IP
@@ -22,8 +22,8 @@ MAINTENANCE_MODE="${MAINTENANCE_MODE:-true}"
 # Azure MySQL target (your known values)
 AZ_MYSQL_SERVER_NAME="${AZ_MYSQL_SERVER_NAME:-fest-db}"
 AZ_MYSQL_HOST="${AZ_MYSQL_HOST:-${AZ_MYSQL_SERVER_NAME}.mysql.database.azure.com}"
-AZ_MYSQL_DB="${AZ_MYSQL_DB:-laravel}"
-AZ_MYSQL_USER="${AZ_MYSQL_USER:-appuser@${AZ_MYSQL_SERVER_NAME}}"
+AZ_MYSQL_DB="${AZ_MYSQL_DB:-laravel}"                # <-- target DB name
+AZ_MYSQL_USER="${AZ_MYSQL_USER:-appuser}"            # <-- Flexible Server: no @server suffix
 
 # ========= Helpers / cleanup =========
 cleanup() {
@@ -76,13 +76,13 @@ chmod 600 "\$HOME/.my_cw.cnf"
 EOF
 
 echo "📥 Dumping database '${CW_DB_NAME}' from Cloudways over SSH..."
-# NOTE: removed --set-gtid-purged and --column-statistics for MariaDB/older MySQL compatibility
+# NOTE: dump the schema/data only (NO 'CREATE DATABASE'/'USE') so we can import into target DB
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
   "${CW_SSH_USER}@${CW_SSH_HOST}" "
     set -euo pipefail
     mysqldump \
       --defaults-extra-file=\$HOME/.my_cw.cnf \
-      --databases '${CW_DB_NAME}' \
+      ${CW_DB_NAME} \
       --single-transaction --quick --lock-tables=0 \
       --routines --triggers --events \
       --hex-blob \
@@ -98,7 +98,14 @@ ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
 
 ls -lh dump.sql.gz
 
-echo "📤 Importing into Azure MySQL (${AZ_MYSQL_HOST}) over TLS..."
+echo "🔍 Testing Azure MySQL login as ${AZ_MYSQL_USER}..."
+mysql --host="$AZ_MYSQL_HOST" \
+      --user="$AZ_MYSQL_USER" \
+      --password="$MYSQL_APP_PASSWORD" \
+      --ssl-mode=REQUIRED \
+      -e "SELECT CURRENT_USER(), USER();"
+
+echo "📤 Ensuring target DB '${AZ_MYSQL_DB}' exists, then importing over TLS..."
 # Ensure target DB exists
 mysql --host="$AZ_MYSQL_HOST" \
       --user="$AZ_MYSQL_USER" \
@@ -106,12 +113,13 @@ mysql --host="$AZ_MYSQL_HOST" \
       --ssl-mode=REQUIRED \
       -e "CREATE DATABASE IF NOT EXISTS \\\`${AZ_MYSQL_DB}\\\`;"
 
-# Import dump
+# Import dump INTO the target DB
 zcat dump.sql.gz | mysql \
   --host="$AZ_MYSQL_HOST" \
   --user="$AZ_MYSQL_USER" \
   --password="$MYSQL_APP_PASSWORD" \
-  --ssl-mode=REQUIRED
+  --ssl-mode=REQUIRED \
+  -D "$AZ_MYSQL_DB"
 
 # Optional: maintenance mode around artisan
 if [[ "$MAINTENANCE_MODE" == "true" ]]; then

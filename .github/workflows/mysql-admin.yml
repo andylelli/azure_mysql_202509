@@ -269,8 +269,8 @@ jobs:
           # Toggle via workflow input
           MAINTENANCE_MODE: ${{ github.event.inputs.maintenance_mode }}
 
-          # Optional overrides (else script defaults are used)
+          # Optional overrides (else script defaults)
           # AZ_MYSQL_SERVER_NAME: fest-db
           # AZ_MYSQL_DB: laravel
-          # AZ_MYSQL_USER: appuser@fest-db
+          # AZ_MYSQL_USER: appuser
         run: bash "$MYSQL_INFRA_DIR/migrate.sh"
