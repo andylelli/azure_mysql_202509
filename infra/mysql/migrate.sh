@@ -111,7 +111,8 @@ mysql --host="$AZ_MYSQL_HOST" \
       --user="$AZ_MYSQL_USER" \
       --password="$MYSQL_APP_PASSWORD" \
       --ssl-mode=REQUIRED \
-      -e "CREATE DATABASE IF NOT EXISTS \\\`${AZ_MYSQL_DB}\\\`;"
+      -e "CREATE DATABASE IF NOT EXISTS \`$AZ_MYSQL_DB\`;"
+
 
 # Import dump INTO the target DB
 zcat dump.sql.gz | mysql \
