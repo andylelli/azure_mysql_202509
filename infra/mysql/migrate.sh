@@ -13,7 +13,7 @@ set -euo pipefail
 : "${CW_SSH_USER:?}"         # Cloudways master SSH username
 : "${CW_SSH_KEY:?}"          # Private key PEM (GitHub secret)
 
-# Azure (target app user password)
+# Azure (target)
 : "${MYSQL_APP_PASSWORD:?}"  # Azure MySQL app user's password
 
 # ========= Optional / defaults =========
@@ -29,7 +29,11 @@ AZ_MYSQL_USER="${AZ_MYSQL_USER:-appuser}"     # Flexible Server: no @server suff
 cleanup() {
   set +e
   echo "🧹 Cleaning up..."
-  # Remove temp firewall rule for runner if we created it
+  if [[ -n "${ALLOW_ALL_AZURE:-}" ]]; then
+    az mysql flexible-server firewall-rule delete \
+      -g "$AZURE_RG" -n "$AZ_MYSQL_SERVER_NAME" \
+      --rule-name AllowAllAzureIPs --yes >/dev/null 2>&1 || true
+  fi
   if [[ -n "${FW_CREATED:-}" ]]; then
     az mysql flexible-server firewall-rule delete \
       -g "$AZURE_RG" -n "$AZ_MYSQL_SERVER_NAME" \
@@ -92,7 +96,7 @@ ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
       --no-tablespaces \
       --skip-comments
   " \
-| sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g' \
+| sed -E 's/DEFINER=\`[^`]+\`@\`[^`]+\`/DEFINER=CURRENT_USER/g' \
 | gzip -c > dump.sql.gz
 
 # ---- Remove the temp defaults file on Cloudways ----
@@ -124,23 +128,16 @@ zcat dump.sql.gz | mysql \
   --ssl-mode=REQUIRED \
   -D "$AZ_MYSQL_DB"
 
-# ---- Ensure Container App outbound IPs are allowed in Azure MySQL ----
-echo "🌐 Ensuring Container App outbound IPs are allowed in Azure MySQL firewall..."
-CA_OUT_IPS=$(az containerapp show -g "$AZURE_RG" -n "$ACA_NAME" --query "properties.outboundIpAddresses" -o tsv | tr ' ' '\n' | sort -u || true)
-i=1
-while read -r IP; do
-  [ -z "$IP" ] && continue
-  RULE="caout-$i"
-  echo " - Allowing $IP as $RULE"
-  az mysql flexible-server firewall-rule create \
-    -g "$AZURE_RG" -n "$AZ_MYSQL_SERVER_NAME" \
-    --rule-name "$RULE" \
-    --start-ip-address "$IP" \
-    --end-ip-address "$IP" >/dev/null || true
-  i=$((i+1))
-done <<< "$CA_OUT_IPS"
+# ---- Temporarily allow ALL Azure services (incl. Container Apps) ----
+echo "🌐 Temporarily allowing all Azure services to reach Azure MySQL..."
+az mysql flexible-server firewall-rule create \
+  -g "$AZURE_RG" -n "$AZ_MYSQL_SERVER_NAME" \
+  --rule-name AllowAllAzureIPs \
+  --start-ip-address 0.0.0.0 \
+  --end-ip-address 0.0.0.0 >/dev/null || true
+ALLOW_ALL_AZURE=1
 
-# ---- Laravel maintenance (optional), migrate, caches, and bring up ----
+# ---- Laravel maintenance (optional), migrate, caches, bring up ----
 if [[ "$MAINTENANCE_MODE" == "true" ]]; then
   echo "🛠️  Putting app in maintenance mode..."
   script -q -c "az containerapp exec \
@@ -162,4 +159,4 @@ script -q -c "az containerapp exec \
     ( [ \"$MAINTENANCE_MODE\" = \"true\" ] && php artisan up || true )
   '\"" /dev/null
 
-echo "🎉 Migration completed successfully."
+echo '🎉 Migration completed successfully.'
