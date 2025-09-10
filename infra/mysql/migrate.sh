@@ -22,24 +22,24 @@ MAINTENANCE_MODE="${MAINTENANCE_MODE:-true}"
 # Azure MySQL target (your known values)
 AZ_MYSQL_SERVER_NAME="${AZ_MYSQL_SERVER_NAME:-fest-db}"
 AZ_MYSQL_HOST="${AZ_MYSQL_HOST:-${AZ_MYSQL_SERVER_NAME}.mysql.database.azure.com}"
-AZ_MYSQL_DB="${AZ_MYSQL_DB:-laravel}"                # <-- target DB name
-AZ_MYSQL_USER="${AZ_MYSQL_USER:-appuser}"            # <-- Flexible Server: no @server suffix
+AZ_MYSQL_DB="${AZ_MYSQL_DB:-laravel}"         # target DB name used by Laravel
+AZ_MYSQL_USER="${AZ_MYSQL_USER:-appuser}"     # Flexible Server: no @server suffix
 
 # ========= Helpers / cleanup =========
 cleanup() {
   set +e
   echo "🧹 Cleaning up..."
-  # Remove temp firewall rule if we created it
+  # Remove temp firewall rule for runner if we created it
   if [[ -n "${FW_CREATED:-}" ]]; then
     az mysql flexible-server firewall-rule delete \
       -g "$AZURE_RG" -n "$AZ_MYSQL_SERVER_NAME" \
       --rule-name gha-runner --yes >/dev/null 2>&1 || true
   fi
-  # Remove temp key file
   rm -f cw_ssh_key >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
+# ---- Allow this CI runner to reach Azure MySQL (for the import) ----
 echo "🌐 Allowing this runner IP to reach Azure MySQL..."
 RUNNER_IP="$(curl -fsS https://api.ipify.org)"
 az mysql flexible-server firewall-rule create \
@@ -49,16 +49,19 @@ az mysql flexible-server firewall-rule create \
   --end-ip-address "$RUNNER_IP" >/dev/null
 FW_CREATED=1
 
+# ---- Prepare SSH key for Cloudways ----
 echo "🔑 Preparing SSH key..."
 umask 077
 printf '%s\n' "$CW_SSH_KEY" > cw_ssh_key
 chmod 600 cw_ssh_key
 
+# ---- Ensure mysqldump exists on Cloudways ----
 echo "🔎 Ensuring 'mysqldump' exists on Cloudways..."
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
   "${CW_SSH_USER}@${CW_SSH_HOST}" "command -v mysqldump >/dev/null" \
   || { echo "❌ 'mysqldump' not found on the server"; exit 1; }
 
+# ---- Create a temp defaults file on Cloudways so password isn't in argv ----
 echo "📝 Creating temporary my.cnf on Cloudways (hidden, strict perms)..."
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
   "${CW_SSH_USER}@${CW_SSH_HOST}" "bash -s" <<EOF
@@ -75,8 +78,8 @@ CFG
 chmod 600 "\$HOME/.my_cw.cnf"
 EOF
 
+# ---- Dump the source DB schema+data (no CREATE DATABASE/USE) ----
 echo "📥 Dumping database '${CW_DB_NAME}' from Cloudways over SSH..."
-# NOTE: dump the schema/data only (NO 'CREATE DATABASE'/'USE') so we can import into target DB
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
   "${CW_SSH_USER}@${CW_SSH_HOST}" "
     set -euo pipefail
@@ -92,12 +95,14 @@ ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
 | sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g' \
 | gzip -c > dump.sql.gz
 
+# ---- Remove the temp defaults file on Cloudways ----
 echo "🧽 Cleaning temp my.cnf on Cloudways..."
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
   "${CW_SSH_USER}@${CW_SSH_HOST}" "rm -f \"\$HOME/.my_cw.cnf\""
 
 ls -lh dump.sql.gz
 
+# ---- Sanity check Azure MySQL auth, and ensure target DB exists ----
 echo "🔍 Testing Azure MySQL login as ${AZ_MYSQL_USER}..."
 mysql --host="$AZ_MYSQL_HOST" \
       --user="$AZ_MYSQL_USER" \
@@ -106,15 +111,12 @@ mysql --host="$AZ_MYSQL_HOST" \
       -e "SELECT CURRENT_USER(), USER();"
 
 echo "📤 Ensuring target DB '${AZ_MYSQL_DB}' exists, then importing over TLS..."
-# Ensure target DB exists
 mysql --host="$AZ_MYSQL_HOST" \
       --user="$AZ_MYSQL_USER" \
       --password="$MYSQL_APP_PASSWORD" \
       --ssl-mode=REQUIRED \
       -e "CREATE DATABASE IF NOT EXISTS \`$AZ_MYSQL_DB\`;"
 
-
-# Import dump INTO the target DB
 zcat dump.sql.gz | mysql \
   --host="$AZ_MYSQL_HOST" \
   --user="$AZ_MYSQL_USER" \
@@ -122,22 +124,42 @@ zcat dump.sql.gz | mysql \
   --ssl-mode=REQUIRED \
   -D "$AZ_MYSQL_DB"
 
-# Optional: maintenance mode around artisan
+# ---- Ensure Container App outbound IPs are allowed in Azure MySQL ----
+echo "🌐 Ensuring Container App outbound IPs are allowed in Azure MySQL firewall..."
+CA_OUT_IPS=$(az containerapp show -g "$AZURE_RG" -n "$ACA_NAME" --query "properties.outboundIpAddresses" -o tsv | tr ' ' '\n' | sort -u || true)
+i=1
+while read -r IP; do
+  [ -z "$IP" ] && continue
+  RULE="caout-$i"
+  echo " - Allowing $IP as $RULE"
+  az mysql flexible-server firewall-rule create \
+    -g "$AZURE_RG" -n "$AZ_MYSQL_SERVER_NAME" \
+    --rule-name "$RULE" \
+    --start-ip-address "$IP" \
+    --end-ip-address "$IP" >/dev/null || true
+  i=$((i+1))
+done <<< "$CA_OUT_IPS"
+
+# ---- Laravel maintenance (optional), migrate, caches, and bring up ----
 if [[ "$MAINTENANCE_MODE" == "true" ]]; then
   echo "🛠️  Putting app in maintenance mode..."
-  script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan down --render=errors::503 || true'" /dev/null
+  script -q -c "az containerapp exec \
+    --resource-group \"$AZURE_RG\" \
+    --name \"$ACA_NAME\" \
+    --command \"sh -lc 'php artisan down --render=errors::503 || true'\"" /dev/null
 fi
 
-echo "🧭 Running Laravel migrations + cache warmup in Container App..."
-script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan migrate --force'" /dev/null
-script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan config:clear'" /dev/null
-script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan cache:clear'" /dev/null
-script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan route:cache'" /dev/null
-script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan event:cache'" /dev/null
-
-if [[ "$MAINTENANCE_MODE" == "true" ]]; then
-  echo "✅ Bringing app back up..."
-  script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan up || true'" /dev/null
-fi
+echo "🧭 Running Laravel migrations + cache warmup (and bringing app up if needed)..."
+script -q -c "az containerapp exec \
+  --resource-group \"$AZURE_RG\" \
+  --name \"$ACA_NAME\" \
+  --command \"sh -lc '
+    php artisan migrate --force &&
+    php artisan config:clear &&
+    php artisan cache:clear &&
+    php artisan route:cache &&
+    php artisan event:cache &&
+    ( [ \"$MAINTENANCE_MODE\" = \"true\" ] && php artisan up || true )
+  '\"" /dev/null
 
 echo "🎉 Migration completed successfully."
