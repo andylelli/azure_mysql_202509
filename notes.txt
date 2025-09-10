@@ -180,3 +180,17 @@ done
 
 az account set --subscription fff37d4f-d044-4d79-b5aa-b119708ab6ee
 az provider register --namespace Microsoft.DBforMySQL
+
+
+###################################################
+# 8 - Cloudways credentions
+# For the record ecord only
+###################################################
+
+CW_SSH_HOST = 161.35.36.63
+CW_SSH_USER = master_kcpxvusscb
+CW_SSH_KEY = Key from Cloudways
+CW_SSH_ = f7V6TQzDFwva
+
+f7V6TQzDFwva
+

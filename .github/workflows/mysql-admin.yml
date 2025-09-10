@@ -244,99 +244,28 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Install MySQL client + jq
+      - name: Install MySQL client + ssh
         run: |
           sudo apt-get update
-          sudo apt-get install -y mysql-client jq
+          sudo apt-get install -y mysql-client openssh-client jq
 
-      - name: Allow runner IP on Azure MySQL (temporary)
-        run: |
-          set -euo pipefail
-          RUNNER_IP=$(curl -s https://api.ipify.org)
-          az mysql flexible-server firewall-rule create \
-            -g "$AZURE_RG" \
-            -n fest-db \
-            --rule-name gha-runner \
-            --start-ip-address "$RUNNER_IP" \
-            --end-ip-address "$RUNNER_IP"
-
-      - name: (Optional) put app in maintenance mode
-        if: ${{ github.event.inputs.maintenance_mode == 'true' }}
-        run: |
-          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan down --render=errors::503 || true'" /dev/null
-
-      - name: Dump from Cloudways (online, consistent)
+      - name: Run database migration script
         env:
-          # Expect these repo secrets to exist:
-          # CW_DB_HOST=161.35.36.63, CW_DB_PORT=3306, CW_DB_NAME=gthewnsykf, CW_DB_USER=gthewnsykf, CW_DB_PASSWORD=<secret>
-          CW_DB_HOST: ${{ secrets.CW_DB_HOST }}
-          CW_DB_PORT: ${{ secrets.CW_DB_PORT }}
-          CW_DB_NAME: ${{ secrets.CW_DB_NAME }}
-          CW_DB_USER: ${{ secrets.CW_DB_USER }}
+          # From repo env
+          AZURE_RG: ${{ env.AZURE_RG }}
+          ACA_NAME: ${{ env.ACA_NAME }}
+
+          # Cloudways (source)
+          CW_DB_NAME:     ${{ secrets.CW_DB_NAME }}      # gthewnsykf
+          CW_DB_USER:     ${{ secrets.CW_DB_USER }}      # gthewnsykf
           CW_DB_PASSWORD: ${{ secrets.CW_DB_PASSWORD }}
-        run: |
-          set -euo pipefail
-          mysqldump \
-            --host="${CW_DB_HOST}" --port="${CW_DB_PORT:-3306}" \
-            --user="${CW_DB_USER}" --password="${CW_DB_PASSWORD}" \
-            --databases "${CW_DB_NAME}" \
-            --single-transaction --quick --lock-tables=0 \
-            --routines --triggers --events \
-            --hex-blob --default-character-set=utf8mb4 \
-            --set-gtid-purged=OFF --column-statistics=0 --no-tablespaces \
-            --skip-comments \
-          | sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g' \
-          | gzip -c > dump.sql.gz
-          ls -lh dump.sql.gz
+          CW_SSH_HOST:    ${{ secrets.CW_SSH_HOST }}     # Cloudways server IP
+          CW_SSH_USER:    ${{ secrets.CW_SSH_USER }}     # e.g. master user
+          CW_SSH_KEY:     ${{ secrets.CW_SSH_KEY }}      # private key PEM
 
-      - name: Import into Azure MySQL (TLS)
-        env:
-          AZ_MYSQL_HOST: fest-db.mysql.database.azure.com
-          AZ_MYSQL_DB: laravel
-          AZ_MYSQL_USER: appuser@fest-db
-          AZ_MYSQL_PASSWORD: ${{ secrets.MYSQL_APP_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # Ensure target DB exists (no-op if already present)
-          mysql --host="$AZ_MYSQL_HOST" --user="$AZ_MYSQL_USER" --password="$AZ_MYSQL_PASSWORD" --ssl-mode=REQUIRED -e "CREATE DATABASE IF NOT EXISTS \`${AZ_MYSQL_DB}\`;"
-          zcat dump.sql.gz | mysql \
-            --host="$AZ_MYSQL_HOST" \
-            --user="$AZ_MYSQL_USER" \
-            --password="$AZ_MYSQL_PASSWORD" \
-            --ssl-mode=REQUIRED
+          # Azure (target)
+          MYSQL_APP_PASSWORD: ${{ secrets.MYSQL_APP_PASSWORD }}
 
-      - name: Post-import sanity checks (row counts)
-        env:
-          AZ_MYSQL_HOST: fest-db.mysql.database.azure.com
-          AZ_MYSQL_DB: laravel
-          AZ_MYSQL_USER: appuser@fest-db
-          AZ_MYSQL_PASSWORD: ${{ secrets.MYSQL_APP_PASSWORD }}
-        run: |
-          set -euo pipefail
-          mysql --host="$AZ_MYSQL_HOST" --user="$AZ_MYSQL_USER" --password="$AZ_MYSQL_PASSWORD" --ssl-mode=REQUIRED -N -e "
-          SELECT CONCAT('SELECT ''', table_name, ''' AS tbl, COUNT(*) AS cnt FROM \`', table_schema, '\`.\`', table_name, '\`;')
-          FROM information_schema.tables
-          WHERE table_schema='${AZ_MYSQL_DB}' AND table_type='BASE TABLE';
-          " | mysql --host="$AZ_MYSQL_HOST" --user="$AZ_MYSQL_USER" --password="$AZ_MYSQL_PASSWORD" --ssl-mode=REQUIRED -N > counts.txt
-          echo 'Counts on Azure:' && cat counts.txt
-
-      - name: Run Laravel migrations + cache warmup
-        run: |
-          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan migrate --force'" /dev/null
-          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan config:clear'" /dev/null
-          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan cache:clear'" /dev/null
-          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan route:cache'" /dev/null
-
-      - name: Bring app back up
-        if: ${{ github.event.inputs.maintenance_mode == 'true' }}
-        run: |
-          script -q -c "az containerapp exec --resource-group \"$AZURE_RG\" --name \"$ACA_NAME\" --command 'php artisan up || true'" /dev/null
-
-      - name: Cleanup firewall rule
-        if: always()
-        run: |
-          az mysql flexible-server firewall-rule delete \
-            -g "$AZURE_RG" \
-            -n fest-db \
-            --rule-name gha-runner \
-            --yes
+          # Toggle maintenance mode via workflow input
+          MAINTENANCE_MODE: ${{ github.event.inputs.maintenance_mode }}
+        run: bash "$MYSQL_INFRA_DIR/migrate.sh"
