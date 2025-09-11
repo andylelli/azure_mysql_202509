@@ -194,3 +194,15 @@ CW_SSH_ = f7V6TQzDFwva
 
 f7V6TQzDFwva
 
+
+###################################################
+# 9 - Create a Firewall rule to access Azure MySQL via MySQL Workbench
+# For the record ecord only
+###################################################
+
+az mysql flexible-server firewall-rule create \
+  --name fest-db \
+  --resource-group laravel-rg \
+  --rule-name home-ip-8614122026 \
+  --start-ip-address 86.141.220.26 \
+  --end-ip-address 86.141.220.26
