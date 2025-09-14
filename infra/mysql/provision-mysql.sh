@@ -125,7 +125,7 @@ fi
 echo "==> Create DB (idempotent)"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
-# --- Temporarily allow the GitHub runner IP for SQL (only if neither WORKBENCH_IP nor ADMIN_IP set) ---
+# --- Always allow the GitHub runner IP temporarily for the connectivity test ---
 TEMP_RULE=""
 cleanup() {
   if [[ -n "$TEMP_RULE" ]]; then
@@ -134,16 +134,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ -z "${ADMIN_IP}" && -z "${WORKBENCH_IP}" ]]; then
-  echo "==> Detect runner public IP for temporary firewall rule"
-  MYIP="$(curl -fsS https://ifconfig.me 2>/dev/null || curl -fsS https://api.ipify.org 2>/dev/null || true)"
-  if [[ -n "$MYIP" ]]; then
-    TEMP_RULE="gha-$(date +%s)"
-    upsert_fw_rule "$TEMP_RULE" "$MYIP"
-  else
-    echo "   Could not detect runner IP. If this step fails, re-run with ADMIN_IP set."
-  fi
+echo "==> Detect runner public IP for temporary firewall rule"
+MYIP="$(curl -fsS https://ifconfig.me 2>/dev/null || curl -fsS https://api.ipify.org 2>/dev/null || true)"
+if [[ -n "$MYIP" ]]; then
+  TEMP_RULE="gha-$(date +%s)"
+  upsert_fw_rule "$TEMP_RULE" "$MYIP"
+  echo "   Runner IP allowed for this job: $MYIP (rule: $TEMP_RULE)"
+else
+  echo "   (warning) Could not detect runner IP; connectivity test may fail."
 fi
+
 
 # Ensure CLI helper is available
 az config set extension.use_dynamic_install=yes_without_prompt >/dev/null
