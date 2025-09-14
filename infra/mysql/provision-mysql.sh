@@ -6,21 +6,20 @@ RG="${RG:-laravel-rg}"
 LOC="${LOC:-uksouth}"
 SERVER="${SERVER:-fest-db}"
 
-# Exact version string required by Azure; default to 8.4 (LTS).
-MYSQL_VERSION="${MYSQL_VERSION:-8.4}"          # 8.4, 8.0.21, 5.7, or explicit 8.0.x
-
-SKU_NAME="${SKU_NAME:-Standard_B1ms}"          # default Burstable
-TIER="${TIER:-}"                               # Burstable | GeneralPurpose | BusinessCritical (auto-infer)
+# MySQL
+MYSQL_VERSION="${MYSQL_VERSION:-8.4}"
+SKU_NAME="${SKU_NAME:-Standard_B1ms}"
+TIER="${TIER:-}"
 STORAGE_GB="${STORAGE_GB:-20}"
 BACKUP_DAYS="${BACKUP_DAYS:-7}"
 DB_NAME="${DB_NAME:-laravel}"
 APP_USER="${APP_USER:-appuser}"
 ADMIN_USER="${ADMIN_USER:-mysqladmin}"
-ADMIN_IP="${ADMIN_IP:-}"                       # optional legacy allowlist
+ADMIN_IP="${ADMIN_IP:-}"   # optional legacy allowlist
 
 # 🔒 Hardcoded firewall IPs
-CLOUDWAYS_IP="161.35.36.63"                    # Cloudways server IP
-WORKBENCH_IP="86.141.220.26"                   # Your laptop (MySQL Workbench) IP
+CLOUDWAYS_IP="161.35.36.63"
+WORKBENCH_IP="86.141.220.26"
 
 # App/Env
 APP_NAME="${APP_NAME:-laravel-aca}"
@@ -29,6 +28,28 @@ ENV_NAME="${ENV_NAME:-laravel-env}"
 # --- Secrets (required) ---
 : "${MYSQL_ADMIN_PASSWORD:?Missing MYSQL_ADMIN_PASSWORD}"
 : "${MYSQL_APP_PASSWORD:?Missing MYSQL_APP_PASSWORD}"
+
+# --- Helpers ---
+upsert_fw_rule () {
+  # upsert_fw_rule <rule-name> <ipv4>
+  local rule="$1"
+  local ip="$2"
+  if [[ -z "$ip" ]]; then
+    echo "   [skip] $rule: empty IP"
+    return 0
+  fi
+  if az mysql flexible-server firewall-rule show -g "$RG" -n "$SERVER" --rule-name "$rule" >/dev/null 2>&1; then
+    echo "   [update] $rule -> $ip"
+    az mysql flexible-server firewall-rule update \
+      -g "$RG" -n "$SERVER" --rule-name "$rule" \
+      --start-ip-address "$ip" --end-ip-address "$ip" >/dev/null
+  else
+    echo "   [create] $rule -> $ip"
+    az mysql flexible-server firewall-rule create \
+      -g "$RG" -n "$SERVER" --rule-name "$rule" \
+      --start-ip-address "$ip" --end-ip-address "$ip" >/dev/null
+  fi
+}
 
 # --- Normalize / validate version ---
 case "$MYSQL_VERSION" in
@@ -64,66 +85,40 @@ if ! az mysql flexible-server show -g "$RG" -n "$SERVER" >/dev/null 2>&1; then
 fi
 
 echo "==> Ensure public network access is enabled"
-az mysql flexible-server update \
-  --resource-group "$RG" \
-  --name "$SERVER" \
-  --public-network-access Enabled >/dev/null
+az mysql flexible-server update -g "$RG" -n "$SERVER" --public-network-access Enabled >/dev/null
 
 echo "==> Enforce TLS"
 az mysql flexible-server parameter set -g "$RG" -s "$SERVER" \
   --name require_secure_transport --value ON >/dev/null
 
-echo "==> Allow Container Apps Environment outbound IPs"
+echo "==> Allow Container Apps Environment outbound IPs (upsert)"
 ENV_ID=$(az containerapp env show -g "$RG" -n "$ENV_NAME" --query id -o tsv)
+# If the property isn't present yet, ACA_IPS may be empty; that's OK.
 readarray -t ACA_IPS < <(az rest --method get --uri "https://management.azure.com${ENV_ID}?api-version=2025-01-01" \
-  --query "properties.outboundIpAddresses[]" -o tsv)
+  --query "properties.outboundIpAddresses[]" -o tsv 2>/dev/null || true)
 i=0
 for ip in "${ACA_IPS[@]:-}"; do
-  az mysql flexible-server firewall-rule create \
-    --resource-group "$RG" \
-    --name "$SERVER" \
-    --rule-name "aca-${i}" \
-    --start-ip-address "$ip" \
-    --end-ip-address "$ip" >/dev/null || true
+  upsert_fw_rule "aca-${i}" "$ip"
   i=$((i+1))
 done
 
-echo "==> Allow Cloudways server"
-az mysql flexible-server firewall-rule create \
-  --resource-group "$RG" --name "$SERVER" \
-  --rule-name cloudways \
-  --start-ip-address "$CLOUDWAYS_IP" \
-  --end-ip-address "$CLOUDWAYS_IP" >/dev/null || true
-
-echo "==> Allow MySQL Workbench from laptop"
-az mysql flexible-server firewall-rule create \
-  --resource-group "$RG" --name "$SERVER" \
-  --rule-name workbench \
-  --start-ip-address "$WORKBENCH_IP" \
-  --end-ip-address "$WORKBENCH_IP" >/dev/null || true
+echo "==> Allow Cloudways + Workbench (upsert)"
+upsert_fw_rule "cloudways" "$CLOUDWAYS_IP"
+upsert_fw_rule "workbench" "$WORKBENCH_IP"
 
 # Optional legacy admin IP rule
 if [[ -n "${ADMIN_IP}" ]]; then
-  az mysql flexible-server firewall-rule create \
-    --resource-group "$RG" \
-    --name "$SERVER" \
-    --rule-name "admin-ip" \
-    --start-ip-address "$ADMIN_IP" \
-    --end-ip-address "$ADMIN_IP" >/dev/null || true
+  upsert_fw_rule "admin-ip" "$ADMIN_IP"
 fi
 
 echo "==> Create DB (idempotent)"
 az mysql flexible-server db create -g "$RG" -s "$SERVER" -d "$DB_NAME" >/dev/null || true
 
-# --- Temporarily allow the GitHub runner IP for the SQL step (only if neither WORKBENCH_IP nor ADMIN_IP set) ---
+# --- Temporarily allow the GitHub runner IP for SQL (only if neither WORKBENCH_IP nor ADMIN_IP set) ---
 TEMP_RULE=""
 cleanup() {
   if [[ -n "$TEMP_RULE" ]]; then
-    az mysql flexible-server firewall-rule delete \
-      --resource-group "$RG" \
-      --name "$SERVER" \
-      --rule-name "$TEMP_RULE" \
-      --yes >/dev/null 2>&1 || true
+    az mysql flexible-server firewall-rule delete -g "$RG" -n "$SERVER" --rule-name "$TEMP_RULE" --yes >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -133,13 +128,7 @@ if [[ -z "${ADMIN_IP}" && -z "${WORKBENCH_IP}" ]]; then
   MYIP="$(curl -fsS https://ifconfig.me 2>/dev/null || curl -fsS https://api.ipify.org 2>/dev/null || true)"
   if [[ -n "$MYIP" ]]; then
     TEMP_RULE="gha-$(date +%s)"
-    echo "   Detected IP: $MYIP -> creating rule $TEMP_RULE"
-    az mysql flexible-server firewall-rule create \
-      --resource-group "$RG" \
-      --name "$SERVER" \
-      --rule-name "$TEMP_RULE" \
-      --start-ip-address "$MYIP" \
-      --end-ip-address "$MYIP" >/dev/null || true
+    upsert_fw_rule "$TEMP_RULE" "$MYIP"
   else
     echo "   Could not detect runner IP. If this step fails, re-run with ADMIN_IP set."
   fi
@@ -162,28 +151,19 @@ for attempt in {1..18}; do
   sleep 10
 done
 
-echo "==> Create least-privileged app user (via SQL, single statements)"
-# 1) Create user if missing (explicit auth plugin for compatibility)
+echo "==> Create least-privileged app user (via SQL)"
 az mysql flexible-server execute \
-  --name "$SERVER" \
-  --admin-user "$ADMIN_USER" \
-  --admin-password "$MYSQL_ADMIN_PASSWORD" \
+  --name "$SERVER" --admin-user "$ADMIN_USER" --admin-password "$MYSQL_ADMIN_PASSWORD" \
   --database-name "$DB_NAME" \
   --querytext "CREATE USER IF NOT EXISTS '${APP_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${MYSQL_APP_PASSWORD}';" >/dev/null
 
-# 2) Ensure/refresh password with same plugin (idempotent)
 az mysql flexible-server execute \
-  --name "$SERVER" \
-  --admin-user "$ADMIN_USER" \
-  --admin-password "$MYSQL_ADMIN_PASSWORD" \
+  --name "$SERVER" --admin-user "$ADMIN_USER" --admin-password "$MYSQL_ADMIN_PASSWORD" \
   --database-name "$DB_NAME" \
   --querytext "ALTER USER '${APP_USER}'@'%' IDENTIFIED WITH mysql_native_password BY '${MYSQL_APP_PASSWORD}';" >/dev/null
 
-# 3) Grant privileges on the app database
 az mysql flexible-server execute \
-  --name "$SERVER" \
-  --admin-user "$ADMIN_USER" \
-  --admin-password "$MYSQL_ADMIN_PASSWORD" \
+  --name "$SERVER" --admin-user "$ADMIN_USER" --admin-password "$MYSQL_ADMIN_PASSWORD" \
   --database-name "$DB_NAME" \
   --querytext "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${APP_USER}'@'%';" >/dev/null
 
@@ -201,6 +181,10 @@ az containerapp update -g "$RG" -n "$APP_NAME" --set-env-vars \
   DB_PASSWORD=secretref:db-password \
   DB_PORT=3306 DB_SOCKET= \
   LOG_CHANNEL=stderr LOG_LEVEL=info >/dev/null
+
+echo "==> Current firewall rules:"
+az mysql flexible-server firewall-rule list -g "$RG" -n "$SERVER" \
+  --query "[].{name:name,start:startIpAddress,end:endIpAddress}" -o table
 
 echo "==> Done. Host: $HOST"
 
