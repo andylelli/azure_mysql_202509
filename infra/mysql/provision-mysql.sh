@@ -85,7 +85,18 @@ if ! az mysql flexible-server show -g "$RG" -n "$SERVER" >/dev/null 2>&1; then
 fi
 
 echo "==> Ensure public network access is enabled"
-az mysql flexible-server update -g "$RG" -n "$SERVER" --public-network-access Enabled >/dev/null
+if az mysql flexible-server update -h 2>/dev/null | grep -q "public-network-access"; then
+  # Newer CLI supports this flag
+  az mysql flexible-server update -g "$RG" -n "$SERVER" \
+    --public-network-access Enabled >/dev/null
+else
+  # Fallback: generic ARM patch
+  SERVER_ID=$(az mysql flexible-server show -g "$RG" -n "$SERVER" --query id -o tsv)
+  az resource update --ids "$SERVER_ID" --set properties.publicNetworkAccess=Enabled >/dev/null || {
+    echo "   (warning) Could not set publicNetworkAccess via CLI/ARM; continuing."
+  }
+fi
+
 
 echo "==> Enforce TLS"
 az mysql flexible-server parameter set -g "$RG" -s "$SERVER" \
