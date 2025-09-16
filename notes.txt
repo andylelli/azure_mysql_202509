@@ -206,3 +206,8 @@ az mysql flexible-server firewall-rule create \
   --rule-name home-ip-8614122026 \
   --start-ip-address 86.141.220.26 \
   --end-ip-address 86.141.220.26
+
+###################################################
+# 10 - Click Public Azure resources in Azure portal
+# For the record ecord only
+###################################################
