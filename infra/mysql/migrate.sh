@@ -22,7 +22,8 @@ MAINTENANCE_MODE="${MAINTENANCE_MODE:-true}"
 # Migration behavior:
 #   drop_recreate  -> drop ALL target objects and import full dump
 #   no_overwrite   -> do NOT modify existing tables; only create+fill missing tables
-MIGRATION_MODE="${MIGRATION_MODE:-drop_recreate}"
+# Default is SAFE: no_overwrite
+MIGRATION_MODE="${MIGRATION_MODE:-no_overwrite}"
 
 # Azure MySQL target (your known values)
 AZ_MYSQL_SERVER_NAME="${AZ_MYSQL_SERVER_NAME:-fest-db}"
@@ -195,44 +196,34 @@ ls -lh dump.sql.gz || true
 # ---- If drop_recreate, wipe target objects before import ----
 if [[ "$MIGRATION_MODE" == "drop_recreate" ]]; then
   echo "🧨 Dropping ALL objects in target schema '${AZ_MYSQL_DB}' (tables, views, triggers, routines, events)..."
+  # Generate DROP statements WITHOUT column headers, then execute them in the target DB.
   mysql --host="$AZ_MYSQL_HOST" \
         --user="$AZ_MYSQL_USER" \
         --password="$MYSQL_APP_PASSWORD" \
         --ssl-mode=REQUIRED \
-        --batch --raw <<SQL \
+        --skip-column-names --batch <<SQL \
   | mysql --host="$AZ_MYSQL_HOST" \
           --user="$AZ_MYSQL_USER" \
           --password="$MYSQL_APP_PASSWORD" \
           --ssl-mode=REQUIRED \
-          "${AZ_MYSQL_DB}"
-SET FOREIGN_KEY_CHECKS=0;
-
--- Drop views first
+          "$AZ_MYSQL_DB"
+SELECT 'SET FOREIGN_KEY_CHECKS=0;';
 SELECT CONCAT('DROP VIEW IF EXISTS \`', table_name, '\`;')
-FROM information_schema.views
-WHERE table_schema='${AZ_MYSQL_DB}';
-
--- Drop triggers
+  FROM information_schema.views
+ WHERE table_schema='${AZ_MYSQL_DB}';
 SELECT CONCAT('DROP TRIGGER IF EXISTS \`', trigger_name, '\`;')
-FROM information_schema.triggers
-WHERE trigger_schema='${AZ_MYSQL_DB}';
-
--- Drop routines (procedures & functions)
+  FROM information_schema.triggers
+ WHERE trigger_schema='${AZ_MYSQL_DB}';
 SELECT CONCAT('DROP ', routine_type, ' IF EXISTS \`', routine_name, '\`;')
-FROM information_schema.routines
-WHERE routine_schema='${AZ_MYSQL_DB}';
-
--- Drop events
+  FROM information_schema.routines
+ WHERE routine_schema='${AZ_MYSQL_DB}';
 SELECT CONCAT('DROP EVENT IF EXISTS \`', event_name, '\`;')
-FROM information_schema.events
-WHERE event_schema='${AZ_MYSQL_DB}';
-
--- Drop tables last
+  FROM information_schema.events
+ WHERE event_schema='${AZ_MYSQL_DB}';
 SELECT CONCAT('DROP TABLE IF EXISTS \`', table_name, '\`;')
-FROM information_schema.tables
-WHERE table_schema='${AZ_MYSQL_DB}' AND table_type='BASE TABLE';
-
-SET FOREIGN_KEY_CHECKS=1;
+  FROM information_schema.tables
+ WHERE table_schema='${AZ_MYSQL_DB}' AND table_type='BASE TABLE';
+SELECT 'SET FOREIGN_KEY_CHECKS=1;';
 SQL
 fi
 
