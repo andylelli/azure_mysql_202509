@@ -19,6 +19,11 @@ set -euo pipefail
 # ========= Optional / defaults =========
 MAINTENANCE_MODE="${MAINTENANCE_MODE:-true}"
 
+# Migration behavior:
+#   drop_recreate  -> drop ALL target objects and import full dump
+#   no_overwrite   -> do NOT modify existing tables; only create+fill missing tables
+MIGRATION_MODE="${MIGRATION_MODE:-drop_recreate}"
+
 # Azure MySQL target (your known values)
 AZ_MYSQL_SERVER_NAME="${AZ_MYSQL_SERVER_NAME:-fest-db}"
 AZ_MYSQL_HOST="${AZ_MYSQL_HOST:-${AZ_MYSQL_SERVER_NAME}.mysql.database.azure.com}"
@@ -42,6 +47,12 @@ cleanup() {
   rm -f cw_ssh_key >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+# ---- Guard MIGRATION_MODE ----
+case "$MIGRATION_MODE" in
+  drop_recreate|no_overwrite) ;;
+  *) echo "❌ MIGRATION_MODE must be one of: drop_recreate | no_overwrite"; exit 2;;
+esac
 
 # ---- Allow this CI runner to reach Azure MySQL (for the import) ----
 echo "🌐 Allowing this runner IP to reach Azure MySQL..."
@@ -68,10 +79,10 @@ ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
 # ---- Create a temp defaults file on Cloudways so password isn't in argv ----
 echo "📝 Creating temporary my.cnf on Cloudways (hidden, strict perms)..."
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-  "${CW_SSH_USER}@${CW_SSH_HOST}" "bash -s" <<EOF
+  "${CW_SSH_USER}@${CW_SSH_HOST}" "bash -s" <<'EOF'
 set -euo pipefail
 umask 077
-cat > "\$HOME/.my_cw.cnf" <<CFG
+cat > "$HOME/.my_cw.cnf" <<CFG
 [client]
 user=${CW_DB_USER}
 password=${CW_DB_PASSWORD}
@@ -79,32 +90,8 @@ host=127.0.0.1
 port=3306
 default-character-set=utf8mb4
 CFG
-chmod 600 "\$HOME/.my_cw.cnf"
+chmod 600 "$HOME/.my_cw.cnf"
 EOF
-
-# ---- Dump the source DB schema+data (no CREATE DATABASE/USE) ----
-echo "📥 Dumping database '${CW_DB_NAME}' from Cloudways over SSH..."
-ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-  "${CW_SSH_USER}@${CW_SSH_HOST}" "
-    set -euo pipefail
-    mysqldump \
-      --defaults-extra-file=\$HOME/.my_cw.cnf \
-      ${CW_DB_NAME} \
-      --single-transaction --quick --lock-tables=0 \
-      --routines --triggers --events \
-      --hex-blob \
-      --no-tablespaces \
-      --skip-comments
-  " \
-| sed -E 's/DEFINER=\`[^`]+\`@\`[^`]+\`/DEFINER=CURRENT_USER/g' \
-| gzip -c > dump.sql.gz
-
-# ---- Remove the temp defaults file on Cloudways ----
-echo "🧽 Cleaning temp my.cnf on Cloudways..."
-ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-  "${CW_SSH_USER}@${CW_SSH_HOST}" "rm -f \"\$HOME/.my_cw.cnf\""
-
-ls -lh dump.sql.gz
 
 # ---- Sanity check Azure MySQL auth, and ensure target DB exists ----
 echo "🔍 Testing Azure MySQL login as ${AZ_MYSQL_USER}..."
@@ -114,19 +101,153 @@ mysql --host="$AZ_MYSQL_HOST" \
       --ssl-mode=REQUIRED \
       -e "SELECT CURRENT_USER(), USER();"
 
-echo "📤 Ensuring target DB '${AZ_MYSQL_DB}' exists, then importing over TLS..."
+echo "📤 Ensuring target DB '${AZ_MYSQL_DB}' exists..."
 mysql --host="$AZ_MYSQL_HOST" \
       --user="$AZ_MYSQL_USER" \
       --password="$MYSQL_APP_PASSWORD" \
       --ssl-mode=REQUIRED \
       -e "CREATE DATABASE IF NOT EXISTS \`$AZ_MYSQL_DB\`;"
 
-zcat dump.sql.gz | mysql \
-  --host="$AZ_MYSQL_HOST" \
-  --user="$AZ_MYSQL_USER" \
-  --password="$MYSQL_APP_PASSWORD" \
-  --ssl-mode=REQUIRED \
-  -D "$AZ_MYSQL_DB"
+# ---- Make the dump (choice depends on MIGRATION_MODE) ----
+if [[ "$MIGRATION_MODE" == "drop_recreate" ]]; then
+  echo "📥 Dumping FULL database '${CW_DB_NAME}' from Cloudways (includes routines/triggers/events)..."
+  ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+    "${CW_SSH_USER}@${CW_SSH_HOST}" "
+      set -euo pipefail
+      mysqldump \
+        --defaults-extra-file=\$HOME/.my_cw.cnf \
+        ${CW_DB_NAME} \
+        --single-transaction --quick --lock-tables=0 \
+        --routines --triggers --events \
+        --hex-blob \
+        --add-drop-table \
+        --no-tablespaces \
+        --skip-comments
+    " \
+  | sed -E 's/DEFINER=\`[^`]+\`@\`[^`]+\`/DEFINER=CURRENT_USER/g' \
+  | gzip -c > dump.sql.gz
+else
+  echo "📋 Resolving missing tables to migrate (no overwrite of existing tables)..."
+  # List source tables
+  ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+    "${CW_SSH_USER}@${CW_SSH_HOST}" "
+      mysql --defaults-extra-file=\$HOME/.my_cw.cnf -N -e \"
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema='${CW_DB_NAME}' AND table_type='BASE TABLE'
+        ORDER BY 1;
+      \"
+    " > /tmp/src_tables.txt
+
+  # List target tables
+  mysql --host="$AZ_MYSQL_HOST" \
+        --user="$AZ_MYSQL_USER" \
+        --password="$MYSQL_APP_PASSWORD" \
+        --ssl-mode=REQUIRED \
+        -N -e "
+          SELECT table_name
+          FROM information_schema.tables
+          WHERE table_schema='${AZ_MYSQL_DB}' AND table_type='BASE TABLE'
+          ORDER BY 1;
+        " > /tmp/tgt_tables.txt
+
+  sort -u /tmp/src_tables.txt -o /tmp/src_tables.txt
+  sort -u /tmp/tgt_tables.txt -o /tmp/tgt_tables.txt
+
+  # Compute missing = in source but not in target
+  comm -23 /tmp/src_tables.txt /tmp/tgt_tables.txt > /tmp/missing_tables.txt
+  MISSING_COUNT=$(wc -l < /tmp/missing_tables.txt | tr -d '[:space:]' || echo 0)
+
+  if [[ "$MISSING_COUNT" == "0" ]]; then
+    echo "✅ No missing tables to import. Skipping dump/import."
+    # Still clean Cloudways temp my.cnf before exiting later
+    : > dump.sql.gz  # create empty placeholder so later steps don't fail
+  else
+    echo "🧾 Will import $MISSING_COUNT table(s):"
+    cat /tmp/missing_tables.txt | sed 's/^/   - /'
+    # Build a space-separated table list
+    TABLE_LIST=$(tr '\n' ' ' < /tmp/missing_tables.txt | xargs echo || true)
+
+    echo "📥 Dumping ONLY missing tables (no routines/triggers/events)..."
+    ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+      "${CW_SSH_USER}@${CW_SSH_HOST}" "
+        set -euo pipefail
+        mysqldump \
+          --defaults-extra-file=\$HOME/.my_cw.cnf \
+          ${CW_DB_NAME} ${TABLE_LIST} \
+          --single-transaction --quick --lock-tables=0 \
+          --hex-blob \
+          --no-tablespaces \
+          --skip-comments
+      " \
+    | sed -E 's/DEFINER=\`[^`]+\`@\`[^`]+\`/DEFINER=CURRENT_USER/g' \
+    | gzip -c > dump.sql.gz
+  fi
+fi
+
+# ---- Remove the temp defaults file on Cloudways ----
+echo "🧽 Cleaning temp my.cnf on Cloudways..."
+ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+  "${CW_SSH_USER}@${CW_SSH_HOST}" "rm -f \"\$HOME/.my_cw.cnf\""
+
+ls -lh dump.sql.gz || true
+
+# ---- If drop_recreate, wipe target objects before import ----
+if [[ "$MIGRATION_MODE" == "drop_recreate" ]]; then
+  echo "🧨 Dropping ALL objects in target schema '${AZ_MYSQL_DB}' (tables, views, triggers, routines, events)..."
+  mysql --host="$AZ_MYSQL_HOST" \
+        --user="$AZ_MYSQL_USER" \
+        --password="$MYSQL_APP_PASSWORD" \
+        --ssl-mode=REQUIRED \
+        --batch --raw <<SQL
+SET FOREIGN_KEY_CHECKS=0;
+
+-- Drop views first (they can depend on tables)
+SELECT CONCAT('DROP VIEW IF EXISTS \`', table_name, '\`;')
+FROM information_schema.views
+WHERE table_schema='${AZ_MYSQL_DB}';
+
+-- Drop triggers
+SELECT CONCAT('DROP TRIGGER IF EXISTS \`', trigger_name, '\`;')
+FROM information_schema.triggers
+WHERE trigger_schema='${AZ_MYSQL_DB}';
+
+-- Drop routines (procedures & functions)
+SELECT CONCAT('DROP ', routine_type, ' IF EXISTS \`', routine_name, '\`;')
+FROM information_schema.routines
+WHERE routine_schema='${AZ_MYSQL_DB}';
+
+-- Drop events
+SELECT CONCAT('DROP EVENT IF EXISTS \`', event_name, '\`;')
+FROM information_schema.events
+WHERE event_schema='${AZ_MYSQL_DB}';
+
+-- Drop tables last
+SELECT CONCAT('DROP TABLE IF EXISTS \`', table_name, '\`;')
+FROM information_schema.tables
+WHERE table_schema='${AZ_MYSQL_DB}' AND table_type='BASE TABLE';
+
+SET FOREIGN_KEY_CHECKS=1;
+SQL
+  | mysql --host="$AZ_MYSQL_HOST" \
+          --user="$AZ_MYSQL_USER" \
+          --password="$MYSQL_APP_PASSWORD" \
+          --ssl-mode=REQUIRED \
+          "${AZ_MYSQL_DB}"
+fi
+
+# ---- Import (if we actually have content) ----
+if [[ -s dump.sql.gz ]]; then
+  echo "📦 Importing into '${AZ_MYSQL_DB}' over TLS..."
+  zcat dump.sql.gz | mysql \
+    --host="$AZ_MYSQL_HOST" \
+    --user="$AZ_MYSQL_USER" \
+    --password="$MYSQL_APP_PASSWORD" \
+    --ssl-mode=REQUIRED \
+    -D "$AZ_MYSQL_DB"
+else
+  echo "ℹ️ No import file content; nothing to load."
+fi
 
 # ---- Temporarily allow ALL Azure services (incl. Container Apps) ----
 echo "🌐 Temporarily allowing all Azure services to reach Azure MySQL..."
