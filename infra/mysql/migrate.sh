@@ -227,31 +227,19 @@ SELECT 'SET FOREIGN_KEY_CHECKS=1;';
 SQL
 fi
 
-# ---- Import (if we actually have content) ----
-if [[ -s dump.sql.gz ]]; then
-  echo "📦 Importing into '${AZ_MYSQL_DB}' over TLS..."
-  zcat dump.sql.gz | mysql \
-    --host="$AZ_MYSQL_HOST" \
-    --user="$AZ_MYSQL_USER" \
-    --password="$MYSQL_APP_PASSWORD" \
-    --ssl-mode=REQUIRED \
-    -D "$AZ_MYSQL_DB"
-else
-  echo "ℹ️ No import file content; nothing to load."
-fi
-
-# ---- Temporarily allow ALL Azure services (incl. Container Apps) ----
-echo "🌐 Temporarily allowing all Azure services to reach Azure MySQL..."
-az mysql flexible-server firewall-rule create \
-  -g "$AZURE_RG" -n "$AZ_MYSQL_SERVER_NAME" \
-  --rule-name AllowAllAzureIPs \
-  --start-ip-address 0.0.0.0 \
-  --end-ip-address 0.0.0.0 >/dev/null || true
-ALLOW_ALL_AZURE=1
+# ---- Container App exec helpers (robust quoting) ----
+run_exec() {
+  local cmd="$1"
+  script -q -c "az containerapp exec \
+    --resource-group \"$AZURE_RG\" \
+    --name \"$ACA_NAME\" \
+    --command \"$cmd\"" /dev/null
+}
 
 # ---- Laravel maintenance (optional), migrate, caches, bring up ----
 if [[ "$MAINTENANCE_MODE" == "true" ]]; then
   echo "🛠️  Putting app in maintenance mode..."
+  # Needs shell to support '|| true'
   script -q -c "az containerapp exec \
     --resource-group \"$AZURE_RG\" \
     --name \"$ACA_NAME\" \
@@ -259,16 +247,13 @@ if [[ "$MAINTENANCE_MODE" == "true" ]]; then
 fi
 
 echo "🧭 Running Laravel migrations + cache warmup (and bringing app up if needed)..."
-script -q -c "az containerapp exec \
-  --resource-group \"$AZURE_RG\" \
-  --name \"$ACA_NAME\" \
-  --command \"sh -lc '
-    php artisan migrate --force &&
-    php artisan config:clear &&
-    php artisan cache:clear &&
-    php artisan route:cache &&
-    php artisan event:cache &&
-    ( [ \"$MAINTENANCE_MODE\" = \"true\" ] && php artisan up || true )
-  '\"" /dev/null
+run_exec "php artisan migrate --force"
+run_exec "php artisan config:clear"
+run_exec "php artisan cache:clear"
+run_exec "php artisan route:cache"
+run_exec "php artisan event:cache"
+if [[ "$MAINTENANCE_MODE" == "true" ]]; then
+  run_exec "php artisan up"
+fi
 
 echo '🎉 Migration completed successfully.'
