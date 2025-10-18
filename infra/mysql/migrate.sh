@@ -77,12 +77,13 @@ ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
   || { echo "❌ 'mysqldump' not found on the server"; exit 1; }
 
 # ---- Create a temp defaults file on Cloudways so password isn't in argv ----
+# IMPORTANT: unquoted heredoc so local ${CW_DB_USER}/${CW_DB_PASSWORD} expand BEFORE sending to remote.
 echo "📝 Creating temporary my.cnf on Cloudways (hidden, strict perms)..."
 ssh -i cw_ssh_key -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
-  "${CW_SSH_USER}@${CW_SSH_HOST}" "bash -s" <<'EOF'
+  "${CW_SSH_USER}@${CW_SSH_HOST}" "bash -s" <<EOF
 set -euo pipefail
 umask 077
-cat > "$HOME/.my_cw.cnf" <<CFG
+cat > "\$HOME/.my_cw.cnf" <<CFG
 [client]
 user=${CW_DB_USER}
 password=${CW_DB_PASSWORD}
@@ -90,7 +91,7 @@ host=127.0.0.1
 port=3306
 default-character-set=utf8mb4
 CFG
-chmod 600 "$HOME/.my_cw.cnf"
+chmod 600 "\$HOME/.my_cw.cnf"
 EOF
 
 # ---- Sanity check Azure MySQL auth, and ensure target DB exists ----
@@ -160,11 +161,10 @@ else
 
   if [[ "$MISSING_COUNT" == "0" ]]; then
     echo "✅ No missing tables to import. Skipping dump/import."
-    # Still clean Cloudways temp my.cnf before exiting later
-    : > dump.sql.gz  # create empty placeholder so later steps don't fail
+    : > dump.sql.gz  # empty placeholder so later steps don't fail
   else
     echo "🧾 Will import $MISSING_COUNT table(s):"
-    cat /tmp/missing_tables.txt | sed 's/^/   - /'
+    sed 's/^/   - /' /tmp/missing_tables.txt
     # Build a space-separated table list
     TABLE_LIST=$(tr '\n' ' ' < /tmp/missing_tables.txt | xargs echo || true)
 
@@ -199,10 +199,15 @@ if [[ "$MIGRATION_MODE" == "drop_recreate" ]]; then
         --user="$AZ_MYSQL_USER" \
         --password="$MYSQL_APP_PASSWORD" \
         --ssl-mode=REQUIRED \
-        --batch --raw <<SQL
+        --batch --raw <<SQL \
+  | mysql --host="$AZ_MYSQL_HOST" \
+          --user="$AZ_MYSQL_USER" \
+          --password="$MYSQL_APP_PASSWORD" \
+          --ssl-mode=REQUIRED \
+          "${AZ_MYSQL_DB}"
 SET FOREIGN_KEY_CHECKS=0;
 
--- Drop views first (they can depend on tables)
+-- Drop views first
 SELECT CONCAT('DROP VIEW IF EXISTS \`', table_name, '\`;')
 FROM information_schema.views
 WHERE table_schema='${AZ_MYSQL_DB}';
@@ -229,11 +234,6 @@ WHERE table_schema='${AZ_MYSQL_DB}' AND table_type='BASE TABLE';
 
 SET FOREIGN_KEY_CHECKS=1;
 SQL
-  | mysql --host="$AZ_MYSQL_HOST" \
-          --user="$AZ_MYSQL_USER" \
-          --password="$MYSQL_APP_PASSWORD" \
-          --ssl-mode=REQUIRED \
-          "${AZ_MYSQL_DB}"
 fi
 
 # ---- Import (if we actually have content) ----
